@@ -45,6 +45,7 @@ jobs:
         shell: pwsh
         run: |
           python -m nuitka --standalone --onefile `
+            --assume-yes-for-downloads `
             --windows-console-mode=hide `
             --output-filename=DouyinSparkHelper.exe `
             --include-package-data=selenium `
