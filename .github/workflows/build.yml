@@ -1,0 +1,60 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:        # 手动触发
+  push:
+    branches: [ main, master ]
+    paths:
+      - '抖音自动续火花-后端.py'
+      - 'src/**'
+      - 'public/**'
+      - 'index.html'
+      - 'vite.config.js'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'requirements.txt'
+
+jobs:
+  build-win:
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: 设置 Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 安装 Python 依赖 + Nuitka
+        run: |
+          pip install -r requirements.txt
+          pip install nuitka ordered-set zstandard
+
+      - name: 构建前端 dist
+        run: |
+          npm install
+          npm run build
+
+      - name: Nuitka 打包 exe
+        shell: pwsh
+        run: |
+          python -m nuitka --standalone --onefile `
+            --windows-console-mode=hide `
+            --output-filename=DouyinSparkHelper.exe `
+            --include-package-data=selenium `
+            --include-data-dir=dist=dist `
+            --nofollow-import-to=tkinter `
+            抖音自动续火花-后端.py
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: DouyinSparkHelper-exe
+          path: DouyinSparkHelper.exe
+          retention-days: 30
