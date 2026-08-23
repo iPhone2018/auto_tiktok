@@ -1,0 +1,30 @@
+# 自动生成 requirements.txt
+# Selenium + FastAPI 项目，锁定兼容版本，解决 websockets.datastructures、urllib3 依赖问题
+# 注意：已剔除 pyppeteer/pyppeteer2，该包会引发版本死锁
+
+selenium==4.47.0
+urllib3==2.7.0
+websockets==11.0.3
+websocket-client
+
+fastapi
+uvicorn[standard]
+requests
+schedule
+
+# 浏览器相关
+trio
+trio-websocket
+wsproto
+sortedcontainers
+pysocks
+
+# 基础
+pyee==11.1.0
+attrs
+outcome
+sniffio
+
+# 授权卡密签名(Ed25519)
+cryptography
+
