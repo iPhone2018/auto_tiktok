@@ -2082,12 +2082,48 @@ def pick_port(preferred: int = 9844, attempts: int = 20) -> int:
         s.bind(('127.0.0.1', 0))
         return s.getsockname()[1]
 
+def _browser_exe_candidates() -> list:
+    """候选浏览器可执行文件:Chrome(本程序本来就依赖本机 Chrome)> Edge。
+    os.startfile/webbrowser.open 走"默认浏览器"关联,Win10 上关联损坏/被篡改时
+    会返回成功但什么都不弹;直接拉起具体 exe 不依赖关联,是冻结 exe 里最可靠的打开方式。"""
+    cands = []
+    chrome = _find_chrome_binary()
+    if chrome:
+        cands.append(chrome)
+    if sys.platform == 'win32':
+        pf = os.environ.get('PROGRAMFILES(X86)', r'C:\Program Files (x86)')
+        pf64 = os.environ.get('PROGRAMFILES', r'C:\Program Files')
+        cands += [
+            os.path.join(pf, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+            os.path.join(pf64, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+        ]
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                r'SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe') as k:
+                cands.append(winreg.QueryValueEx(k, '')[0])
+        except Exception:
+            pass
+    seen, out = set(), []
+    for p in cands:
+        if p and os.path.exists(p) and p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
 def _open_url(url: str) -> bool:
     """打开浏览器,多级兜底,每步都落日志。
-    Windows 冻结 exe 下 webbrowser.open 可能返回 True 但实际没弹浏览器(默认浏览器
-    关联缺失/被组策略限制),日志还完全静默 —— 所以 Windows 优先直接用 ShellExecute
-    (os.startfile,冻结程序里最可靠),webbrowser.open 降级为兜底。"""
+    Windows 冻结 exe 下 webbrowser.open/os.startfile 都可能"返回成功但实际没弹窗口"
+    (默认浏览器关联缺失/损坏/被组策略限制),所以 Windows 优先直接启动具体的浏览器
+    exe,不走默认关联;os.startfile/webbrowser.open 降级为兜底。"""
     if sys.platform == 'win32':
+        for exe in _browser_exe_candidates():
+            try:
+                subprocess.Popen([exe, url], creationflags=0x08000000)  # CREATE_NO_WINDOW
+                print(f'✅ 浏览器已打开(直接启动 {os.path.basename(exe)})')
+                return True
+            except Exception as e:
+                print(f'⚠️ 直接启动 {os.path.basename(exe)} 失败: {e}')
         try:
             os.startfile(url)
             print('✅ 浏览器已打开(os.startfile)')
