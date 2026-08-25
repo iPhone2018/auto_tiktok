@@ -79,10 +79,24 @@ def _find_chrome_binary():
             return path
     return None
 
+# ====== 打包态检测 ======
+# 注意:Nuitka 故意不设置 sys.frozen(官方要求用 __compiled__ 检测),只有
+# PyInstaller/cx_Freeze 才设 sys.frozen。只判 sys.frozen 会让 Nuitka 打的 exe
+# 全程走进 dev 分支 —— 数据写进 onefile 临时解包目录,退出即被删除。
+IS_FROZEN = bool(getattr(sys, 'frozen', False)) or ('__compiled__' in globals())
+
+def _exe_dir() -> str:
+    """打包版 exe 所在目录。onefile 下 sys.executable 指向临时解包出来的载荷,
+    Nuitka 通过 NUITKA_ONEFILE_BINARY 暴露用户双击的那个原始 exe 路径。"""
+    original = os.environ.get('NUITKA_ONEFILE_BINARY')
+    if original and os.path.exists(original):
+        return os.path.dirname(os.path.abspath(original))
+    return os.path.dirname(os.path.abspath(sys.executable))
+
 # ====== 数据目录:开发模式默认项目根(兼容现有 chrome_profile);
 # 打包后(Nuitka onefile)必须用系统应用数据目录,__file__ 指向临时解包目录 ======
 def _default_data_dir() -> str:
-    if getattr(sys, 'frozen', False):
+    if IS_FROZEN:
         if sys.platform == 'win32':
             base = os.environ.get('APPDATA') or os.path.expanduser('~')
             return os.path.join(base, 'DouyinSpark')
@@ -94,6 +108,66 @@ os.makedirs(APP_DIR, exist_ok=True)
 # 持久化浏览器配置目录:重启服务后保持登录状态
 PROFILE_DIR = os.path.join(APP_DIR, 'chrome_profile')
 os.makedirs(PROFILE_DIR, exist_ok=True)
+
+# ====== 启动日志:打包版控制台被隐藏(--windows-console-mode=hide),
+# stdout 可能不可写,启动崩溃会完全静默。统一落盘到 APP_DIR/startup.log ======
+LOG_PATH = os.path.join(APP_DIR, 'startup.log')
+_log_teed = False
+
+class _Tee:
+    """同时写控制台(若可用)与日志文件;控制台写失败后自动降级为只写文件"""
+    encoding = 'utf-8'
+    errors = 'replace'
+
+    def __init__(self, stream, fp):
+        self._stream = stream
+        self._fp = fp
+
+    def write(self, s):
+        if self._stream is not None:
+            try:
+                self._stream.write(s)
+            except Exception:
+                self._stream = None  # 控制台已隐藏/句柄失效,后续只写文件
+        try:
+            self._fp.write(s)
+        except Exception:
+            pass
+        return len(s)
+
+    def flush(self):
+        for t in (self._stream, self._fp):
+            try:
+                if t is not None:
+                    t.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        return False  # 关掉 uvicorn/click 的 ANSI 着色,日志里不留控制字符
+
+def _setup_startup_log():
+    """打包版(或 SPARK_LOG_FILE=1)把 stdout/stderr 接到日志文件"""
+    global _log_teed
+    # Windows 控制台/输出重定向到文件时默认走 GBK,日志里的 emoji 会抛 UnicodeEncodeError
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
+    if not IS_FROZEN and os.environ.get('SPARK_LOG_FILE') != '1':
+        return
+    try:
+        fp = open(LOG_PATH, 'a', encoding='utf-8', errors='replace', buffering=1)
+    except Exception:
+        return
+    sys.stdout = _Tee(sys.stdout, fp)
+    sys.stderr = _Tee(sys.stderr, fp)
+    _log_teed = True
+    print(f'\n===== 启动 {datetime.now().strftime("%Y-%m-%d %H:%M:%S")} '
+          f'(frozen={IS_FROZEN}, pid={os.getpid()}) =====')
+
+_setup_startup_log()
 
 def _platform_user_agent() -> str:
     if sys.platform == 'win32':
@@ -1351,7 +1425,8 @@ def SetAutoStart(enable: str = Query('0'), authorization: str = Header(None)):
         if sys.platform == 'win32':
             import winreg
             key_path = r'Software\Microsoft\Windows\CurrentVersion\Run'
-            exe = sys.executable
+            # onefile 下 sys.executable 是临时解包出来的载荷,重启后已不存在,必须写原始 exe
+            exe = os.environ.get('NUITKA_ONEFILE_BINARY') or sys.executable
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as k:
                 if want:
                     winreg.SetValueEx(k, 'DouyinSpark', 0, winreg.REG_SZ, f'"{exe}"')
@@ -1364,9 +1439,9 @@ def SetAutoStart(enable: str = Query('0'), authorization: str = Header(None)):
             plist_dir = os.path.expanduser('~/Library/LaunchAgents')
             plist_path = os.path.join(plist_dir, 'com.douyin.spark.plist')
             if want:
-                exe = sys.executable
+                exe = os.environ.get('NUITKA_ONEFILE_BINARY') or sys.executable
                 script = os.path.abspath(__file__)
-                args = [exe, script] if not getattr(sys, 'frozen', False) else [exe]
+                args = [exe] if IS_FROZEN else [exe, script]
                 plist = f'''<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -1991,28 +2066,81 @@ def setup_static():
             return FileResponse(target)
         return FileResponse(os.path.join(STATIC_DIR, 'index.html'))
 
-def pick_port() -> int:
+def pick_port(preferred: int = 9844, attempts: int = 20) -> int:
+    """优先用固定端口(用户可预测、能手动访问),被占用则顺延;全被占用才回退随机端口。
+    随机端口 + 隐藏控制台 = 浏览器没弹出来时用户完全无从下手,所以不再默认随机。"""
     import socket
+    for offset in range(attempts):
+        candidate = preferred + offset
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(('127.0.0.1', candidate))
+                return candidate
+            except OSError:
+                continue
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(('127.0.0.1', 0))
         return s.getsockname()[1]
 
-def open_browser_later(port: int):
-    def _open():
+def _open_url(url: str) -> bool:
+    """三级兜底打开浏览器。Win10 上默认浏览器关联缺失/被组策略限制时 webbrowser.open
+    会静默失败,而原实现用 except: pass 吞掉了 —— 表现就是双击 exe 毫无反应。"""
+    try:
+        if webbrowser.open(url):
+            return True
+    except Exception as e:
+        print(f'⚠️ webbrowser.open 失败: {e}')
+    if sys.platform == 'win32':
         try:
-            webbrowser.open(f'http://127.0.0.1:{port}/home')  # 启动直接进首页
-        except Exception:
-            pass
-    threading.Timer(1.5, _open).start()
+            os.startfile(url)
+            return True
+        except Exception as e:
+            print(f'⚠️ os.startfile 失败: {e}')
+        try:
+            subprocess.Popen(['cmd', '/c', 'start', '', url], creationflags=0x08000000)  # CREATE_NO_WINDOW
+            return True
+        except Exception as e:
+            print(f'⚠️ cmd start 失败: {e}')
+    else:
+        try:
+            subprocess.Popen(['open', url])
+            return True
+        except Exception as e:
+            print(f'⚠️ open 失败: {e}')
+    return False
+
+def open_browser_later(port: int):
+    url = f'http://127.0.0.1:{port}/home'  # 启动直接进首页
+    url_file = os.path.join(APP_DIR, 'url.txt')
+    try:
+        with open(url_file, 'w', encoding='utf-8') as f:
+            f.write(url + '\n')
+    except Exception:
+        pass
+
+    def _open():
+        if _open_url(url):
+            return
+        print(f'❌ 无法自动打开浏览器,请手动访问: {url}')
+        if sys.platform == 'win32':
+            try:
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(
+                    None, f'未能自动打开浏览器,请手动在浏览器中访问:\n\n{url}\n\n'
+                          f'该地址也已保存到:\n{url_file}', '抖音火花助手', 0x40)
+            except Exception:
+                pass
+    t = threading.Timer(1.5, _open)
+    t.daemon = True  # 非守护线程(尤其弹窗未关闭时)会卡住进程退出
+    t.start()
 
 def setup_chromedriver_fallback():
     """打包版兜底:exe 同目录放置 chromedriver(.exe) 时直接使用,避免依赖联网下载"""
     if os.environ.get('CHROMEDRIVER_BIN'):
         return
-    if not getattr(sys, 'frozen', False):
+    if not IS_FROZEN:
         return
-    exe_dir = os.path.dirname(os.path.abspath(sys.executable))
-    cand = os.path.join(exe_dir, 'chromedriver' + ('.exe' if sys.platform == 'win32' else ''))
+    cand = os.path.join(_exe_dir(), 'chromedriver' + ('.exe' if sys.platform == 'win32' else ''))
     if os.path.exists(cand):
         os.environ['CHROMEDRIVER_BIN'] = cand
         print('ℹ️ 检测到同目录 chromedriver,已启用')
@@ -2038,20 +2166,41 @@ def main():
     start_heartbeat()
     restore_tasks_from_db()
     start_scheduler()
-    # 端口:环境变量 > 打包版随机空闲端口 > dev 默认 9844
-    if os.environ.get('PORT'):
-        port = int(os.environ['PORT'])
-    elif getattr(sys, 'frozen', False):
-        port = pick_port()
-    else:
-        port = 9844
-    # 监听地址:打包版仅本机;dev 默认 0.0.0.0(兼容 Docker 容器前端经 host.docker.internal 访问)
-    host = os.environ.get('HOST') or ('127.0.0.1' if getattr(sys, 'frozen', False) else '0.0.0.0')
+    # 端口:环境变量 > 固定 9844(被占用则顺延)
+    port = int(os.environ['PORT']) if os.environ.get('PORT') else pick_port(9844)
+    # 监听地址:打包版仅本机(顺带避开 Win10 防火墙授权弹窗);
+    # dev 默认 0.0.0.0(兼容 Docker 容器前端经 host.docker.internal 访问)
+    host = os.environ.get('HOST') or ('127.0.0.1' if IS_FROZEN else '0.0.0.0')
     setup_static()
+    print(f'🚀 抖音火花助手启动: http://127.0.0.1:{port} (监听 {host})')
     if os.environ.get('SPARK_NO_OPEN') != '1':
         open_browser_later(port)
-    print(f'🚀 抖音火花助手启动: http://127.0.0.1:{port} (监听 {host})')
     uvicorn.run(app, host=host, port=port, reload=False)
 
+def _run():
+    """顶层异常兜底:打包版控制台是隐藏的,不落盘的话启动崩溃将完全无痕"""
+    try:
+        main()
+    except SystemExit:
+        raise
+    except BaseException:
+        import traceback
+        tb = traceback.format_exc()
+        print('❌ 启动失败:\n' + tb)
+        if not _log_teed:  # 日志没接上时补写一次,保证 traceback 一定落盘
+            try:
+                with open(LOG_PATH, 'a', encoding='utf-8', errors='replace') as f:
+                    f.write(f'\n===== 启动失败 {datetime.now():%Y-%m-%d %H:%M:%S} =====\n{tb}')
+            except Exception:
+                pass
+        if sys.platform == 'win32':
+            try:
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(
+                    None, f'程序启动失败:\n\n{tb[-700:]}\n\n完整日志:\n{LOG_PATH}', '抖音火花助手', 0x10)
+            except Exception:
+                pass
+        sys.exit(1)
+
 if __name__ == "__main__":
-    main()
+    _run()
