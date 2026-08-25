@@ -31,6 +31,11 @@ import uvicorn
 from selenium import webdriver
 from selenium.webdriver import Keys
 from selenium.webdriver.chrome.service import Service as ChromeService
+# selenium 4.x 的 webdriver.ChromeOptions / webdriver.Chrome 走 __getattr__ 懒加载,
+# Nuitka 静态分析看不到,冻结 exe 会报 No module named 'selenium.webdriver.chrome.options'。
+# 显式导入保证打包时带上(仅用于打包可见性,运行时仍用 webdriver.ChromeOptions)
+from selenium.webdriver.chrome.options import Options as _ChromeOptions
+from selenium.webdriver.chrome.webdriver import WebDriver as _ChromeWebDriver
 from selenium.webdriver.common.by import By
 from selenium.common.exceptions import NoSuchElementException, WebDriverException, SessionNotCreatedException
 from fastapi import FastAPI, Header, Request, Query, Body
@@ -2163,6 +2168,19 @@ def open_browser_later(port: int):
         pass
     print(f'🌐 浏览器将自动打开: {url}')
 
+    def _wait_server_ready(timeout: float = 20) -> bool:
+        """等 uvicorn 真正开始响应再开浏览器。onefile 解包 + 冷启动在慢机器上
+        可能超过 1.5s,直接开会导致页面显示"无法访问",且不算打开失败、不会重试。"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                if requests.get(url, timeout=2).status_code < 500:
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.5)
+        return False
+
     def _open_final():
         if _open_url(url):
             return
@@ -2177,6 +2195,8 @@ def open_browser_later(port: int):
                 pass
 
     def _open():
+        if not _wait_server_ready():
+            print('⚠️ 服务迟迟未就绪,仍尝试打开浏览器')
         if _open_url(url):
             return
         print('⏳ 首次打开失败,5 秒后重试一次')
