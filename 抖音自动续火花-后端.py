@@ -2083,27 +2083,35 @@ def pick_port(preferred: int = 9844, attempts: int = 20) -> int:
         return s.getsockname()[1]
 
 def _open_url(url: str) -> bool:
-    """三级兜底打开浏览器。Win10 上默认浏览器关联缺失/被组策略限制时 webbrowser.open
-    会静默失败,而原实现用 except: pass 吞掉了 —— 表现就是双击 exe 毫无反应。"""
+    """打开浏览器,多级兜底,每步都落日志。
+    Windows 冻结 exe 下 webbrowser.open 可能返回 True 但实际没弹浏览器(默认浏览器
+    关联缺失/被组策略限制),日志还完全静默 —— 所以 Windows 优先直接用 ShellExecute
+    (os.startfile,冻结程序里最可靠),webbrowser.open 降级为兜底。"""
+    if sys.platform == 'win32':
+        try:
+            os.startfile(url)
+            print('✅ 浏览器已打开(os.startfile)')
+            return True
+        except Exception as e:
+            print(f'⚠️ os.startfile 失败: {e}')
     try:
         if webbrowser.open(url):
+            print('✅ 浏览器已打开(webbrowser.open)')
             return True
+        print('⚠️ webbrowser.open 返回 False')
     except Exception as e:
         print(f'⚠️ webbrowser.open 失败: {e}')
     if sys.platform == 'win32':
         try:
-            os.startfile(url)
-            return True
-        except Exception as e:
-            print(f'⚠️ os.startfile 失败: {e}')
-        try:
             subprocess.Popen(['cmd', '/c', 'start', '', url], creationflags=0x08000000)  # CREATE_NO_WINDOW
+            print('✅ 浏览器已打开(cmd start)')
             return True
         except Exception as e:
             print(f'⚠️ cmd start 失败: {e}')
     else:
         try:
             subprocess.Popen(['open', url])
+            print('✅ 浏览器已打开(open)')
             return True
         except Exception as e:
             print(f'⚠️ open 失败: {e}')
@@ -2117,8 +2125,9 @@ def open_browser_later(port: int):
             f.write(url + '\n')
     except Exception:
         pass
+    print(f'🌐 浏览器将自动打开: {url}')
 
-    def _open():
+    def _open_final():
         if _open_url(url):
             return
         print(f'❌ 无法自动打开浏览器,请手动访问: {url}')
@@ -2130,6 +2139,15 @@ def open_browser_later(port: int):
                           f'该地址也已保存到:\n{url_file}', '抖音火花助手', 0x40)
             except Exception:
                 pass
+
+    def _open():
+        if _open_url(url):
+            return
+        print('⏳ 首次打开失败,5 秒后重试一次')
+        t2 = threading.Timer(5, _open_final)
+        t2.daemon = True
+        t2.start()
+
     t = threading.Timer(1.5, _open)
     t.daemon = True  # 非守护线程(尤其弹窗未关闭时)会卡住进程退出
     t.start()
