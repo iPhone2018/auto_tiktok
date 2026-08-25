@@ -61,17 +61,19 @@ jobs:
           }
           Get-ChildItem dist | Select-Object Name, Length
 
-      - name: 定位 selenium-manager.exe
+      - name: 校验 selenium-manager.exe 在包内
         shell: pwsh
         run: |
-          # --include-package-data=selenium 不保证带上这个可执行文件,显式指定更稳
+          # selenium 4.47 的 wheel 已把 selenium-manager.exe 列入 package data,
+          # --include-package-data=selenium 会把它作为 exe 一并带入产物;
+          # 若再 --include-data-files 指定同一路径,会与已注册的 exe 冲突(Nuitka FATAL)。
+          # 这里只做存在性校验,防止 selenium 升级后 exe 从 package data 消失而悄悄丢失
           $sm = python -c "import selenium, os; print(os.path.join(os.path.dirname(selenium.__file__), 'webdriver', 'common', 'windows', 'selenium-manager.exe'))"
           if (-not (Test-Path $sm)) {
             Write-Error "未找到 selenium-manager.exe: $sm"
             exit 1
           }
-          Write-Host "selenium-manager: $sm"
-          "SELENIUM_MANAGER=$sm" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "selenium-manager(随 package data 打包): $sm"
 
       - name: Nuitka 打包 exe (${{ matrix.console }})
         shell: pwsh
@@ -82,7 +84,6 @@ jobs:
             --output-filename=DouyinSparkHelper${{ matrix.suffix }}.exe `
             --include-package=uvicorn `
             --include-package-data=selenium `
-            --include-data-files="$env:SELENIUM_MANAGER=selenium/webdriver/common/windows/selenium-manager.exe" `
             --include-package-data=certifi `
             --include-data-dir=dist=dist `
             --nofollow-import-to=tkinter `
