@@ -8,6 +8,9 @@
 import os
 import re
 import gzip
+import io
+import platform
+import zipfile
 import shutil
 import json
 import base64
@@ -197,21 +200,127 @@ def build_options():
     options.add_experimental_option('excludeSwitches', ['enable-automation', 'enable-logging', 'useAutomationExtension'])
     return options
 
+def _cached_chromedriver_path() -> str:
+    """本程序自己下载存放的驱动(APP_DIR/chromedriver/),跨重启复用"""
+    exe = 'chromedriver' + ('.exe' if sys.platform == 'win32' else '')
+    cand = os.path.join(APP_DIR, 'chromedriver', exe)
+    return cand if os.path.exists(cand) else ''
+
+def _local_chrome_version(chrome_bin: str):
+    """chrome --version → (major, minor, build, patch),失败返回 None"""
+    flags = 0x08000000 if sys.platform == 'win32' else 0  # CREATE_NO_WINDOW
+    try:
+        out = subprocess.run([chrome_bin, '--version'], capture_output=True, text=True,
+                             timeout=20, creationflags=flags)
+        m = re.search(r'(\d+)\.(\d+)\.(\d+)\.(\d+)', (out.stdout or '') + (out.stderr or ''))
+        return tuple(map(int, m.groups())) if m else None
+    except Exception as e:
+        print(f'⚠️ 获取本机 Chrome 版本失败: {e}')
+        return None
+
+def _pick_cft_version(versions: list, chrome_ver: tuple):
+    """从 Chrome for Testing 版本列表挑最匹配本机 Chrome 的:精确匹配 > 同 major 最新 > 全局最新"""
+    parsed = []
+    for v in versions:
+        m = re.fullmatch(r'(\d+)\.(\d+)\.(\d+)\.(\d+)', v.get('version', ''))
+        if m:
+            parsed.append((tuple(map(int, m.groups())), v))
+    if not parsed:
+        return None
+    parsed.sort(key=lambda x: x[0])
+    for k, v in parsed:
+        if k == chrome_ver:
+            return v
+    same_major = [v for k, v in parsed if k[0] == chrome_ver[0]]
+    if same_major:
+        return same_major[-1]
+    return parsed[-1][1]
+
+def download_chromedriver_from_mirror() -> str:
+    """兜底:Selenium Manager 离线无缓存且联网失败时(国内网络访问不了 Google),
+    从 npmmirror 的 Chrome for Testing 镜像下载与本机 Chrome 匹配的 chromedriver
+    到 APP_DIR/chromedriver/。成功返回可执行文件路径,失败返回空字符串(不抛异常)。"""
+    chrome_bin = _find_chrome_binary()
+    if not chrome_bin:
+        return ''
+    ver = _local_chrome_version(chrome_bin)
+    if not ver:
+        return ''
+    if sys.platform == 'win32':
+        plat = 'win64'
+    elif sys.platform == 'darwin':
+        plat = 'mac-arm64' if platform.machine() == 'arm64' else 'mac-x64'
+    else:
+        plat = 'linux64'
+    try:
+        print(f'📥 从 npmmirror 镜像获取 chromedriver(本机 Chrome {".".join(map(str, ver))})…')
+        r = requests.get('https://registry.npmmirror.com/-/binary/chrome-for-testing/'
+                         'known-good-versions-with-downloads.json', timeout=30)
+        r.raise_for_status()
+        chosen = _pick_cft_version(r.json().get('versions', []), ver)
+        if not chosen:
+            return ''
+        url = ''
+        for p in chosen.get('downloads', {}).get('chromedriver', []):
+            if p.get('platform') == plat:
+                url = p.get('url', '').replace(
+                    'https://storage.googleapis.com/chrome-for-testing-public/',
+                    'https://cdn.npmmirror.com/binaries/chrome-for-testing/')
+                break
+        if not url:
+            return ''
+        print(f'📥 匹配版本 {chosen["version"]},下载 {url}')
+        resp = requests.get(url, timeout=120)
+        resp.raise_for_status()
+        exe = 'chromedriver' + ('.exe' if sys.platform == 'win32' else '')
+        dest_dir = os.path.join(APP_DIR, 'chromedriver')
+        os.makedirs(dest_dir, exist_ok=True)
+        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+            zf.extractall(dest_dir)
+        # zip 内有顶层目录(如 chromedriver-win64/),把可执行文件翻到上层
+        for root, _dirs, files in os.walk(dest_dir):
+            for fn in files:
+                if fn == exe:
+                    src = os.path.join(root, fn)
+                    dst = os.path.join(dest_dir, fn)
+                    if src != dst:
+                        shutil.move(src, dst)
+                    if sys.platform != 'win32':
+                        os.chmod(dst, 0o755)
+                    print(f'✅ chromedriver 已就绪: {dst}')
+                    return dst
+        return ''
+    except Exception as e:
+        print(f'⚠️ npmmirror 获取 chromedriver 失败: {e}')
+        return ''
+
 def create_driver():
-    """创建浏览器实例:
-    1) CHROMEDRIVER_BIN 指定驱动 → 直接使用(打包版同目录兜底)
-    2) 否则 Selenium Manager 自动匹配,但先离线(用缓存驱动,国内网络下 SM 联网解析可能卡死),失败再联网下载"""
+    """创建浏览器实例,驱动获取顺序:
+    1) CHROMEDRIVER_BIN 指定 → 直接使用(打包版 exe 同目录 chromedriver.exe 兜底)
+    2) APP_DIR/chromedriver 里已有的驱动(镜像下载过的,跨重启复用)
+    3) Selenium Manager 先离线(用缓存),失败再联网
+    4) 还不行 → npmmirror 镜像下载匹配本机 Chrome 的驱动
+    5) 全失败 → 给出指引性报错"""
     options = build_options()
-    driver_bin = os.environ.get('CHROMEDRIVER_BIN', '')
+    driver_bin = os.environ.get('CHROMEDRIVER_BIN', '') or _cached_chromedriver_path()
     if driver_bin:
         return webdriver.Chrome(service=ChromeService(executable_path=driver_bin), options=options)
     os.environ['SE_OFFLINE'] = 'true'
     try:
         return webdriver.Chrome(options=options)
-    except Exception:
-        # 缓存无驱动(首次使用)→ 允许联网下载
-        os.environ['SE_OFFLINE'] = 'false'
-        return webdriver.Chrome(options=options)
+    except Exception as e1:
+        print(f'⚠️ Selenium Manager 离线无缓存: {str(e1)[:120]}')
+        os.environ.pop('SE_OFFLINE', None)  # 删掉才是确定的"在线",设 'false' 字符串语义有歧义
+        try:
+            return webdriver.Chrome(options=options)
+        except Exception as e2:
+            print(f'⚠️ Selenium Manager 联网获取失败: {str(e2)[:120]}')
+    driver_bin = download_chromedriver_from_mirror()
+    if driver_bin:
+        os.environ['CHROMEDRIVER_BIN'] = driver_bin
+        return webdriver.Chrome(service=ChromeService(executable_path=driver_bin), options=options)
+    raise RuntimeError('自动获取 chromedriver 失败:请将与本机 Chrome 版本匹配的 '
+                       'chromedriver.exe 放到程序同目录后重试')
 
 
 # ====== 机器码 & 单实例 ======
@@ -491,6 +600,8 @@ def restart_driver():
         except Exception:
             pass
     if not _find_chrome_binary():
+        if sys.platform == 'win32':
+            raise RuntimeError('未找到本机安装的 Google Chrome,请先安装 Chrome,或用 CHROME_BIN 指定路径')
         raise RuntimeError('未找到本机安装的 Google Chrome,请确认 /Applications/Google Chrome.app 存在,或用 CHROME_BIN 指定路径')
     driver = create_driver()
     driver.get(DOUYIN_CHAT)
