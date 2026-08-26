@@ -67,7 +67,7 @@
           <el-dropdown @command="handleCommand">
             <span class="user-info">
               <el-avatar :size="32" :icon="UserFilled" />
-              <span class="username">{{ license.isActive ? (license.daysLeft >= 1 ? `剩余 ${license.daysLeft} 天` : '剩余不足1天') : '未激活' }}</span>
+              <span class="username">{{ headerAccountText }}</span>
               <el-icon><ArrowDown /></el-icon>
             </span>
             <template #dropdown>
@@ -95,8 +95,8 @@ import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox, ElTooltip } from 'element-plus'
 import { useLicenseStore } from '../stores/license'
-import { shutdownApp } from '../api/douyin'
-import { browserStatus } from '../stores/browser'
+import { shutdownApp, getLoginStatus, getDouyinUserInfo } from '../api/douyin'
+import { browserStatus, loginState, accountNickname, setLoginState, setAccountNickname } from '../stores/browser'
 import {
   Fold,
   Expand,
@@ -145,10 +145,15 @@ const closeSidebar = () => {
 onMounted(() => {
   checkMobile()
   window.addEventListener('resize', checkMobile)
+  startAccountPolling()
 })
 
 onUnmounted(() => {
   window.removeEventListener('resize', checkMobile)
+  if (accountTimer) {
+    clearInterval(accountTimer)
+    accountTimer = null
+  }
 })
 
 watch(isCollapsed, (val) => {
@@ -170,6 +175,44 @@ const currentMenuTitle = computed(() => {
   const menu = menuList.find(item => item.path === activeMenu.value)
   return menu ? menu.title : ''
 })
+
+// 右上角显示当前抖音账号状态(未登录/会话过期/已登录:昵称)
+const headerAccountText = computed(() => {
+  if (loginState.value === 'in') {
+    return accountNickname.value ? `已登录:${accountNickname.value}` : '已登录'
+  }
+  return loginState.value === 'expired' ? '会话已过期' : '未登录'
+})
+
+let accountTimer = null
+const refreshAccountStatus = async () => {
+  try {
+    const res = await getLoginStatus()
+    const state = res.login_state || (res.data === 'Yes' ? 'in' : 'out')
+    setLoginState(state)
+    if (state === 'in') {
+      try {
+        const info = await getDouyinUserInfo()
+        if (info.code === 200 && info.data?.logged_in) {
+          setAccountNickname(info.data.nickname || info.data.douyin_id || '')
+        } else {
+          setAccountNickname('')
+        }
+      } catch (e) {
+        // 昵称取不到时仅显示"已登录",不影响状态判定
+      }
+    } else {
+      setAccountNickname('')
+    }
+  } catch (e) {
+    setLoginState('out')
+    setAccountNickname('')
+  }
+}
+const startAccountPolling = () => {
+  refreshAccountStatus()
+  accountTimer = setInterval(refreshAccountStatus, 20000)
+}
 
 const handleMenuSelect = (path) => {
   router.push(path)
