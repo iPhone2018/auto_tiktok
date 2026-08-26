@@ -24,6 +24,7 @@ import hashlib
 import secrets
 import functools
 import math
+import atexit
 import urllib.parse
 import webbrowser
 from datetime import datetime, timezone, timedelta
@@ -302,9 +303,16 @@ def create_driver():
     4) 还不行 → npmmirror 镜像下载匹配本机 Chrome 的驱动
     5) 全失败 → 给出指引性报错"""
     options = build_options()
-    driver_bin = os.environ.get('CHROMEDRIVER_BIN', '') or _cached_chromedriver_path()
+    explicit_bin = os.environ.get('CHROMEDRIVER_BIN', '')
+    driver_bin = explicit_bin or _cached_chromedriver_path()
     if driver_bin:
-        return webdriver.Chrome(service=ChromeService(executable_path=driver_bin), options=options)
+        try:
+            return webdriver.Chrome(service=ChromeService(executable_path=driver_bin), options=options)
+        except Exception:
+            if explicit_bin:
+                raise  # 用户显式指定的驱动:错误透出(Init 接口有版本提示)
+            # 自动缓存的驱动已失效(Chrome 升级等):降级走自动获取
+            print('⚠️ 本地缓存驱动已失效,改用自动获取')
     os.environ['SE_OFFLINE'] = 'true'
     try:
         return webdriver.Chrome(options=options)
@@ -407,6 +415,8 @@ def acquire_single_instance() -> bool:
         except (OSError, IOError):
             print('程序已在运行,请勿重复打开。')
             return False
+def AiqingGongyu_text() -> str:
+    """今日名言(空消息时的默认文案),网络失败时返回兜底文本"""
     try:
         req = requests.get('https://v2.xxapi.cn/api/aiqinggongyu', timeout=10)
         if req.status_code == 200:
@@ -592,6 +602,42 @@ Login_is_bool = False
 driver = None
 douyin = None
 
+# 会话过期状态:心跳确认"真掉线"后置 True,前端提示"会话已过期,请重新登录";
+# 重新登录成功/主动退出登录时复位
+LOGIN_EXPIRED = False
+LOGIN_EXPIRED_REASON = ''
+
+def _kill_profile_orphans(profile_dir: str):
+    """杀掉此前异常退出遗留的 Chrome 进程。仍占着同一 --user-data-dir 的旧进程
+    会让新会话直接退出('Chrome instance exited'),所以创建会话前先清理。
+    mac/Windows 各自按命令行过滤,只杀带本项目 profile 参数的进程,不碰用户正常浏览器"""
+    if not profile_dir:
+        return
+    try:
+        if sys.platform == 'win32':
+            ps = (f"Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
+                  f"Where-Object {{ $_.CommandLine -like '*--user-data-dir={profile_dir}*' }} | "
+                  "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }")
+            subprocess.run(['powershell', '-NoProfile', '-Command', ps],
+                           capture_output=True, timeout=20)
+        else:
+            # 注意:模式不能带前导 '--',否则被 pkill 当作选项解析而失效
+            subprocess.run(['pkill', '-f', f'user-data-dir={profile_dir}'],
+                           capture_output=True, timeout=20)
+        time.sleep(1)  # 等进程释放 profile 锁
+    except Exception as e:
+        print(f'⚠️ 清理遗留 Chrome 进程失败: {e}')
+
+def _quit_driver_atexit():
+    """进程退出前关闭浏览器会话,防止遗留孤儿 Chrome 占用 profile"""
+    try:
+        if driver is not None:
+            driver.quit()
+    except Exception:
+        pass
+
+atexit.register(_quit_driver_atexit)
+
 def restart_driver():
     global driver, douyin, init, Login_is_bool
     if driver is not None:
@@ -599,11 +645,19 @@ def restart_driver():
             driver.quit()
         except Exception:
             pass
+    # 异常退出遗留的 Chrome 仍占着 profile 会让新会话直接退出,先清理
+    _kill_profile_orphans(PROFILE_DIR)
     if not _find_chrome_binary():
         if sys.platform == 'win32':
             raise RuntimeError('未找到本机安装的 Google Chrome,请先安装 Chrome,或用 CHROME_BIN 指定路径')
         raise RuntimeError('未找到本机安装的 Google Chrome,请确认 /Applications/Google Chrome.app 存在,或用 CHROME_BIN 指定路径')
-    driver = create_driver()
+    try:
+        driver = create_driver()
+    except SessionNotCreatedException:
+        # 'Chrome instance exited' 常见于旧进程尚未释放 profile,再清一次并重试
+        _kill_profile_orphans(PROFILE_DIR)
+        time.sleep(2)
+        driver = create_driver()
     driver.get(DOUYIN_CHAT)
     time.sleep(3)  # 等页面稳定,降低启动期渲染崩溃概率
     douyin = Douyin(driver)
@@ -614,11 +668,20 @@ def restart_driver():
         Login_is_bool = False
     init = True
 
+def _login_panel_visible() -> bool:
+    """登录弹窗是否可见。扫码成功后抖音常把弹窗隐藏而非从 DOM 移除,
+    只看节点存在会把"已登录"误判成"还在等扫码" —— 必须按可见性判断"""
+    try:
+        els = driver.find_elements(By.XPATH, LOGIN_PANEL_XPATH)
+        return any(e.is_displayed() for e in els)
+    except Exception:
+        return True  # 异常时按"弹窗还在"处理,避免误判已登录
+
 def ensure_login_dialog():
-    """确保抖音登录弹窗存在；页面状态过期(弹窗关闭/被风控页替代)时重载聊天页"""
+    """确保抖音登录弹窗可见；页面状态过期(弹窗关闭/被风控页替代)时重载聊天页"""
     for _attempt in range(3):
         try:
-            if driver.find_elements(By.XPATH, LOGIN_PANEL_XPATH):
+            if _login_panel_visible():
                 return True
         except Exception:
             pass
@@ -627,10 +690,7 @@ def ensure_login_dialog():
         except Exception:
             pass
         time.sleep(6)
-    try:
-        return bool(driver.find_elements(By.XPATH, LOGIN_PANEL_XPATH))
-    except Exception:
-        return False
+    return _login_panel_visible()
 
 def with_driver_recovery(fn):
     """driver 操作包装：加锁串行化；tab 崩溃时自动重建浏览器并重试一次"""
@@ -671,9 +731,15 @@ def _cancel_retry_jobs(db_id):
         if getattr(j, 'spark_retry_of', None) == db_id:
             schedule.cancel_job(j)
 
-def _scheduled_send(db_id, name, text, attempt=0):
-    """定时任务发送:失败 60s 后自动重试(最多 3 次),全程落 task_logs;暂停期间跳过并记录待补发"""
+def _scheduled_send(db_id, name, text, slot_id='default', attempt=0):
+    """定时任务发送:失败 60s 后自动重试(最多 3 次),全程落 task_logs;暂停期间跳过并记录待补发。
+    任务按账号归属:slot_id 为其他抖音账号时,当前账号登录态下不执行"""
     run_time = time.strftime('%H:%M')
+    cur_uid = _current_douyin_id()
+    # 该任务属于其他账号 → 不执行(任务保留,切回原账号后恢复执行)
+    if slot_id not in ('', 'default', cur_uid):
+        db_log_task(db_id, name, run_time, 'skipped', '该任务属于其他抖音账号,当前账号下不执行')
+        return
     # 授权失效时跳过(不进入补发队列,激活后次日正常执行)
     if check_license():
         db_log_task(db_id, name, run_time, 'skipped', '授权未激活或已过期,任务未执行')
@@ -697,28 +763,46 @@ def _scheduled_send(db_id, name, text, attempt=0):
     db_log_task(db_id, name, run_time, 'failed', err_msg)
     if attempt < MAX_SEND_RETRIES:
         print(f'⏰ 定时任务发送失败 → {name}: {err_msg}({RETRY_DELAY_SECONDS}s 后重试)')
-        j = schedule.every(RETRY_DELAY_SECONDS).seconds.do(_scheduled_send, db_id, name, text, attempt + 1)
+        j = schedule.every(RETRY_DELAY_SECONDS).seconds.do(_scheduled_send, db_id, name, text, slot_id, attempt + 1)
         j.spark_retry_of = db_id
     else:
         print(f'❌ 定时任务最终失败 → {name}: {err_msg}')
 
-def _daily_task_job(db_id, name, text):
+def _daily_task_job(db_id, name, text, slot_id):
     """每日定时任务入口"""
-    _scheduled_send(db_id, name, text, 0)
+    _scheduled_send(db_id, name, text, slot_id, 0)
 
-def register_task_job(db_id, name, text, play_time):
+def register_task_job(db_id, name, text, play_time, slot_id):
     """注册每日定时任务(新增与启动恢复共用)"""
-    return schedule.every().day.at(play_time).do(_daily_task_job, db_id, name, text)
+    return schedule.every().day.at(play_time).do(_daily_task_job, db_id, name, text, slot_id)
+
+def _stamp_legacy_tasks():
+    """旧任务(slot_id='default')按当前登录账号盖章归属:程序升级前创建的任务
+    归到当下登录的抖音账号,此后切换账号不会再误执行"""
+    uid = _current_douyin_id()
+    if not uid:
+        return
+    try:
+        with get_conn() as conn:
+            cur = conn.execute("UPDATE tasks SET slot_id=? WHERE slot_id IN ('', 'default')", (uid,))
+            conn.commit()
+            if cur.rowcount:
+                print(f'🏷️ 已将 {cur.rowcount} 个旧任务归属到当前抖音账号')
+    except Exception:
+        pass
 
 def restore_tasks_from_db():
-    """服务启动时从 SQLite 恢复定时任务"""
+    """服务启动时从 SQLite 恢复全部定时任务(各账号任务都注册,执行时按账号过滤)"""
+    _stamp_legacy_tasks()
     rows = db_load_tasks()
     for row in rows:
+        sid = row.get('slot_id') or 'default'
+        bucket = scheduled_tasks.setdefault(sid, {})
         task_id = f"{row['run_time']}_{row['friend_name']}"
-        if task_id in scheduled_tasks:
+        if task_id in bucket:
             continue
-        job = register_task_job(row['id'], row['friend_name'], row['message'], row['run_time'])
-        scheduled_tasks[task_id] = {'job': job, 'db_id': row['id']}
+        job = register_task_job(row['id'], row['friend_name'], row['message'], row['run_time'], sid)
+        bucket[task_id] = {'job': job, 'db_id': row['id']}
     if rows:
         print(f'🔄 已从数据库恢复 {len(rows)} 个定时任务')
 
@@ -784,12 +868,12 @@ def require_license():
         'license_rollback': '检测到系统时间异常,请恢复正确时间后重启',
         'license_locked': '授权已锁定',
         'license_config_missing': '程序未配置授权,请联系卖家',
-        'license_account_mismatch': '当前登录的抖音账号与授权绑定的账号不一致,请登录绑定的抖音账号',
+        'license_account_mismatch': '当前抖音账号未激活授权,请为该账号激活卡密,或换回已激活的抖音账号',
     }
     return {'code': 403, 'data': _map.get(err['data'], err['data'])}
 
 # 定时任务存储
-scheduled_tasks = {}  # 格式: {任务ID: job对象}
+scheduled_tasks = {}  # 格式: {账号slot_id: {任务ID: {'job': job对象, 'db_id': 数据库id}}},按抖音账号分桶
 
 
 # 定时线程
@@ -834,11 +918,13 @@ CREATE TABLE IF NOT EXISTS used_cards (
 );
 CREATE TABLE IF NOT EXISTS tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    friend_name TEXT NOT NULL UNIQUE,
+    slot_id TEXT NOT NULL DEFAULT 'default',
+    friend_name TEXT NOT NULL,
     run_time TEXT NOT NULL,
     message TEXT NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    UNIQUE(slot_id, friend_name)
 );
 CREATE TABLE IF NOT EXISTS task_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -856,7 +942,8 @@ CREATE TABLE IF NOT EXISTS app_meta (
 '''
 
 def _ensure_schema(conn):
-    """表结构缺失时自动重建(防删库后新建空库导致静默失败);旧库自动补 hours 列"""
+    """表结构缺失时自动重建(防删库后新建空库导致静默失败);旧库自动迁移:
+    补 hours/douyin_id 列、tasks.slot_id 列(任务按抖音账号归属)"""
     try:
         row = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='license_activation'").fetchone()
         if not row:
@@ -868,6 +955,10 @@ def _ensure_schema(conn):
                 conn.execute('ALTER TABLE license_activation ADD COLUMN hours INTEGER NOT NULL DEFAULT 0')
             if 'douyin_id' not in cols:
                 conn.execute("ALTER TABLE license_activation ADD COLUMN douyin_id TEXT NOT NULL DEFAULT ''")
+            # 任务按账号归属:旧库补 slot_id 列(旧任务归 'default',启动时按当前登录账号盖章归属)
+            tcols = [r[1] for r in conn.execute('PRAGMA table_info(tasks)')]
+            if 'slot_id' not in tcols:
+                conn.execute("ALTER TABLE tasks ADD COLUMN slot_id TEXT NOT NULL DEFAULT 'default'")
             conn.commit()
     except Exception:
         pass
@@ -916,11 +1007,11 @@ def db_load_cookies():
     except Exception:
         return []
 
-def db_insert_task(friend_name, run_time, message):
+def db_insert_task(friend_name, run_time, message, slot_id='default'):
     with get_conn() as conn:
         cur = conn.execute(
-            'INSERT INTO tasks(friend_name, run_time, message, enabled, created_at) VALUES (?,?,?,1,?)',
-            (friend_name, run_time, message, _utc_iso()))
+            'INSERT INTO tasks(slot_id, friend_name, run_time, message, enabled, created_at) VALUES (?,?,?,?,1,?)',
+            (slot_id, friend_name, run_time, message, _utc_iso()))
         conn.commit()
         return cur.lastrowid
 
@@ -1072,13 +1163,60 @@ def read_license_markers():
             continue
     return None
 
-def _load_activation():
+def _load_activation(douyin_id=''):
+    """读取激活记录:douyin_id='' 取机器卡行;非空取该抖音标识的账号卡行。
+    多行共存:换号激活新卡不会覆盖旧账号的激活记录,时长照常扣减"""
+    try:
+        with get_conn() as conn:
+            row = conn.execute('SELECT * FROM license_activation WHERE douyin_id=? ORDER BY id DESC LIMIT 1',
+                               (douyin_id,)).fetchone()
+        return dict(row) if row else None
+    except Exception:
+        return None
+
+def _load_latest_activation_any():
+    """取最新一行激活记录(不区分机器卡/账号卡,未登录等场景兜底用)"""
     try:
         with get_conn() as conn:
             row = conn.execute('SELECT * FROM license_activation ORDER BY id DESC LIMIT 1').fetchone()
         return dict(row) if row else None
     except Exception:
         return None
+
+def _activation_error(act):
+    """单条激活记录的行内校验(不含账号匹配,由读取处处理):有效返回 None"""
+    if detect_clock_rollback(act):
+        return {'code': 403, 'data': 'license_rollback'}
+    expires = _parse_iso(act.get('expires_at'))
+    if expires and _now_utc() >= expires:
+        return {'code': 403, 'data': 'license_expired'}
+    return None
+
+def _current_douyin_id() -> str:
+    return (db_get_meta('douyin_user_id') or '').strip()
+
+def _effective_activation():
+    """当前登录账号应生效的激活记录:(机器卡 > 当前账号卡)。返回 (记录, 错误字典|None)
+    兼容旧库单行记录:无机器卡且无当前账号卡时,回落到最新一行按旧规则校验"""
+    machine_act = _load_activation('')
+    if machine_act:
+        return machine_act, _activation_error(machine_act)
+    cur_uid = _current_douyin_id()
+    if cur_uid:
+        act = _load_activation(cur_uid)
+        if act:
+            return act, _activation_error(act)
+        # 有绑定其他账号的卡,但当前账号没有 → 账号不匹配(提示换回或重新激活)
+        if _load_latest_activation_any():
+            return None, {'code': 403, 'data': 'license_account_mismatch'}
+    # 旧库兼容:单行记录(可能绑 uid),未登录时无法校验账号匹配,登录即生效
+    act = _load_latest_activation_any()
+    if act:
+        bound_uid = (act.get('douyin_id') or '').strip()
+        if bound_uid and cur_uid and cur_uid != bound_uid:
+            return act, {'code': 403, 'data': 'license_account_mismatch'}
+        return act, _activation_error(act)
+    return None, {'code': 403, 'data': 'license_not_activated'}
 
 def detect_clock_rollback(activation) -> bool:
     now = _now_utc()
@@ -1103,14 +1241,22 @@ def _touch_last_seen(activation):
         pass
 
 def license_status() -> dict:
-    """授权状态(无鉴权接口用)"""
+    """授权状态(无鉴权接口用)。按当前登录账号展示:
+    机器卡 > 当前账号卡;时长按墙钟照扣,过期显示 expired"""
     mc = get_machine_code()
     if not _license_config_ok():
         return {'status': 'config_missing', 'machine_code': mc, 'activated_at': None,
                 'expires_at': None, 'days_left': None, 'expires_in_seconds': None, 'now': _utc_iso()}
-    act = _load_activation()
+    act, err = _effective_activation()
     if not act:
-        return {'status': 'none', 'machine_code': mc, 'activated_at': None,
+        # 兼容旧命名(前端 license store 依赖):license_* → 旧状态名。
+        # 账号不匹配(当前账号没有卡)对外展示为"未激活" —— 按账号激活模型下这就是没激活
+        _legacy = {'license_expired': 'expired', 'license_rollback': 'rollback',
+                   'license_account_mismatch': 'none', 'license_locked': 'locked',
+                   'license_not_activated': 'none', 'license_config_missing': 'config_missing'}
+        status = err['data'] if err else 'none'
+        status = _legacy.get(status, status)
+        return {'status': status, 'machine_code': mc, 'activated_at': None,
                 'expires_at': None, 'days_left': None, 'expires_in_seconds': None, 'now': _utc_iso()}
     now = _now_utc()
     expires = _parse_iso(act.get('expires_at'))
@@ -1120,42 +1266,30 @@ def license_status() -> dict:
         expires_in_seconds = max(0, int((expires - now).total_seconds()))
         days_left = max(0, math.ceil(expires_in_seconds / 86400))
     bound_uid = (act.get('douyin_id') or '').strip()
-    cur_uid = (db_get_meta('douyin_user_id') or '').strip()
-    if detect_clock_rollback(act):
-        status = 'rollback'
-    elif expires and now >= expires:
-        status = 'expired'
-    elif bound_uid and cur_uid and cur_uid != bound_uid:
-        status = 'account_mismatch'
+    if err:
+        status = err['data']
     elif LICENSE_LOCKED:
         status = 'locked'
     else:
         status = act.get('status') or 'active'
+    # 兼容旧命名(前端 license store 依赖)
+    _legacy = {'license_expired': 'expired', 'license_rollback': 'rollback',
+               'license_account_mismatch': 'account_mismatch', 'license_locked': 'locked'}
+    status = _legacy.get(status, status)
     return {'status': status, 'machine_code': mc, 'activated_at': act.get('activated_at'),
             'expires_at': act.get('expires_at'), 'days_left': days_left,
             'expires_in_seconds': expires_in_seconds, 'bound_douyin_id': bound_uid, 'now': _utc_iso()}
 
 def check_license():
     """授权校验:有效返回 None,否则返回 {code, data} 错误字典(接口可直接返回)。
-    无 dev 模式:公钥未配置时一律 fail-closed。"""
+    机器卡有效 > 当前账号卡有效;时长照扣,到期返回 license_expired"""
     if not _license_config_ok():
         return {'code': 403, 'data': 'license_config_missing'}
     if LICENSE_LOCKED:
         return {'code': 403, 'data': 'license_locked'}
-    act = _load_activation()
-    if not act:
-        return {'code': 403, 'data': 'license_not_activated'}
-    if detect_clock_rollback(act):
-        return {'code': 403, 'data': 'license_rollback'}
-    expires = _parse_iso(act.get('expires_at'))
-    if expires and _now_utc() >= expires:
-        return {'code': 403, 'data': 'license_expired'}
-    # 卡密绑定抖音账号:已登录时校验当前账号是否一致(未登录无法校验,登录即生效)
-    bound_uid = (act.get('douyin_id') or '').strip()
-    if bound_uid:
-        cur_uid = (db_get_meta('douyin_user_id') or '').strip()
-        if cur_uid and cur_uid != bound_uid:
-            return {'code': 403, 'data': 'license_account_mismatch'}
+    act, err = _effective_activation()
+    if err:
+        return err
     _touch_last_seen(act)
     return None
 
@@ -1216,10 +1350,9 @@ def activate_card(card: str) -> dict:
         if not Login_is_bool:
             raise LicenseError(400, '请先登录抖音账号,再激活卡密(该卡密已与抖音账号绑定)')
         try:
-            info = _extract_douyin_account(driver.page_source)
+            cur_uid = _remember_douyin_identity(resolve_current_douyin_account())
         except Exception:
-            info = {}
-        cur_uid = info.get('douyin_id') or ''
+            cur_uid = _current_douyin_id()
         if not cur_uid:
             raise LicenseError(400, '无法读取当前抖音账号标识,请确认已登录抖音')
         if cur_uid != bound_uid:
@@ -1229,7 +1362,9 @@ def activate_card(card: str) -> dict:
     activated_at = _utc_iso(now)
     expires_at = _utc_iso(expires)
     with get_conn() as conn:
-        conn.execute('DELETE FROM license_activation')
+        # 多行模型:只替换同类行 —— 机器卡(douyin_id='')只留一张;账号卡按绑定标识各留一张,
+        # 换号激活新卡不会覆盖其他账号的激活记录(时长照常从各自激活时刻扣减)
+        conn.execute('DELETE FROM license_activation WHERE douyin_id=?', (bound_uid,))
         conn.execute(
             'INSERT INTO license_activation(card_id, machine_code, days, hours, douyin_id, activated_at, expires_at, status, last_seen_time) VALUES (?,?,?,?,?,?,?,?,?)',
             (payload['card_id'], get_machine_code(), payload['days'], payload.get('hours', 0),
@@ -1322,10 +1457,13 @@ def _apply_license_lock(reason: str):
 def _license_guard_loop():
     while True:
         try:
-            err = check_license()
-            # 仅过期/回拨触发硬锁;未激活/未配置状态不锁(用户需要操作界面)
-            if err and err['data'] in ('license_expired', 'license_rollback'):
-                _apply_license_lock(err['data'])
+            # 只有机器卡过期/回拨才硬锁(整机授权失效);账号卡到期/回拨仅显示状态
+            # 并让该账号的任务跳过执行(check_license 逐条判定),切换回其他账号不受影响
+            machine_act = _load_activation('')
+            if machine_act:
+                err = _activation_error(machine_act)
+                if err and err['data'] in ('license_expired', 'license_rollback'):
+                    _apply_license_lock(err['data'])
         except Exception:
             pass
         time.sleep(10)
@@ -1340,11 +1478,11 @@ HEARTBEAT_INTERVAL = 60
 PROBE_URL = os.environ.get('SPARK_PROBE_URL', 'https://www.douyin.com/chat?isPopup=1')
 
 def probe_login(cookies):
-    """轻量 HTTP 探测,返回 (登录态, 抖音标识):
+    """轻量 HTTP 探测,返回 (登录态, 账号身份字典, 原因说明):
     登录态 True=已登录 False=已掉线 None=无法判定(网络异常/页面结构变化,本次不判定)
     判定依据:聊天页 SSR 数据 RENDER_DATA 中的 app.user.isLogin 布尔值(实测权威字段)"""
     if not cookies:
-        return (None, None)
+        return (None, None, '无 cookie')
     session = requests.Session()
     for c in cookies:
         try:
@@ -1356,30 +1494,37 @@ def probe_login(cookies):
         r = session.get(PROBE_URL, timeout=15, allow_redirects=True,
                         headers={'User-Agent': _platform_user_agent()})
     except Exception:
-        return (None, None)
+        return (None, None, '网络异常')
     data = _parse_render_data(r.text)
     if data:
         try:
             user = data.get('app', {}).get('user', {})
             if isinstance(user, dict) and 'isLogin' in user:
-                is_login = user.get('isLogin')
-                if isinstance(is_login, str):
-                    is_login = is_login.lower() in ('true', '1')
-                uid = ''
-                if is_login:
-                    odin = data.get('app', {}).get('odin', {})
-                    uid = str(user.get('unique_id') or user.get('uid')
-                              or user.get('sec_uid') or odin.get('user_unique_id') or '')
-                return (bool(is_login), uid)
+                info = _account_from_render_data(data)
+                return (info['logged_in'], info,
+                        '' if info['logged_in'] else 'RENDER_DATA isLogin=false')
         except Exception:
             pass
     # 兜底:被踢到 passport 登录域 → 未登录
     if 'passport.douyin.com' in r.url:
-        return (False, None)
-    return (None, None)  # 页面结构异常时不判定,避免误伤
+        return (False, None, 'passport 重定向')
+    return (None, None, '页面结构异常')  # 页面结构异常时不判定,避免误伤
+
+def _driver_logged_in() -> bool:
+    """浏览器会话仍在且带抖音登录 cookie 时返回 True。实测比 HTTP 探测更权威:
+    风控/网络差异下 HTTP 探测可能假掉线(用户明明没退出登录),用它拦截误判"""
+    global init, driver
+    if not init or driver is None:
+        return False
+    try:
+        driver.execute_script('return 1')
+        return any(c.get('name') == 'sessionid_ss' for c in driver.get_cookies())
+    except Exception:
+        return False
 
 def _heartbeat_loop():
     global Login_is_bool
+    last_login_state = None  # 上一次判定,只在状态翻转时打日志,避免每分钟刷屏
     while True:
         try:
             # 授权异常时不探测(授权锁已暂停任务)
@@ -1388,22 +1533,36 @@ def _heartbeat_loop():
                 continue
             cookies = db_load_cookies()
             if cookies:
-                result, uid = probe_login(cookies)
+                result, probed, detail = probe_login(cookies)
                 heartbeat_state['last_probe'] = _utc_iso()
                 if result is True:
                     heartbeat_state['last_ok'] = _utc_iso()
                     Login_is_bool = True
-                    if uid:
-                        db_set_meta('douyin_user_id', uid)  # 心跳顺带刷新账号标识缓存
+                    LOGIN_EXPIRED = False
+                    LOGIN_EXPIRED_REASON = ''
+                    _remember_douyin_identity(probed)  # 心跳顺带刷新账号标识缓存
                     if db_get_meta('tasks_paused') == '1':
                         resume_all_tasks()
                         print('💓 心跳:抖音已恢复登录,任务已恢复')
+                    last_login_state = True
                 elif result is False:
-                    heartbeat_state['last_ok'] = None
-                    Login_is_bool = False
-                    if db_get_meta('tasks_paused') != '1':
-                        pause_tasks('心跳检测到抖音登录已失效')
-                    print('💔 心跳:抖音登录已失效,任务已暂停')
+                    if _driver_logged_in():
+                        # 浏览器会话仍有效:HTTP 探测多半是误判,不暂停任务
+                        if last_login_state is not False:
+                            print(f'⚠️ 心跳:HTTP 探测判定掉线({detail}),但浏览器会话仍有效,不暂停任务')
+                        last_login_state = False
+                    else:
+                        heartbeat_state['last_ok'] = None
+                        Login_is_bool = False
+                        LOGIN_EXPIRED = True
+                        LOGIN_EXPIRED_REASON = detail
+                        if db_get_meta('tasks_paused') != '1':
+                            pause_tasks(f'心跳检测到抖音登录已失效({detail})')
+                        if last_login_state is not False:
+                            print(f'💔 心跳:抖音登录已失效({detail}),任务已暂停(请重新登录)')
+                        last_login_state = False
+                else:
+                    last_login_state = None
         except Exception:
             pass
         time.sleep(HEARTBEAT_INTERVAL)
@@ -1412,6 +1571,16 @@ def start_heartbeat():
     threading.Thread(target=_heartbeat_loop, daemon=True).start()
 
 # ====== 抖音账号唯一标识提取 ======
+# 【铁律】抖音标识必须取【账号级】字段 —— 同一个抖音账号,不管退出重登多少次、
+# 换不换设备,取到的值都必须一模一样。RENDER_DATA 里可用的账号级字段(实测):
+#   app.user.info.uid / app.odin.user_id   数字账号 ID(永久不变,首选)
+#   app.user.info.secUid                   加密账号 ID(永久不变,uid 取不到时兜底)
+#   app.user.info.uniqueId                 抖音号(用户可改,只做展示,不做标识)
+# 绝对不能用 app.odin.user_unique_id —— 那是【设备/会话级】埋点 ID,重登即变。
+# 历史 BUG:旧代码按 user.unique_id / user.uid / user.sec_uid 三个键取值,可真实结构
+# 里它们都在 user.info 下,三个候选全部落空,于是一路兜底到 odin.user_unique_id,
+# 造成"每次重新登录抖音标识都不一样",卡密绑定和任务归属随之全部错乱。
+DOUYIN_ID_SCHEME = 'v2-account-uid'  # 标识方案版本(用于把库里遗留的设备级标识迁移一次)
 
 def _parse_render_data(page_or_html: str):
     """解析页面 SSR 数据 RENDER_DATA(URL 编码的 JSON),返回 dict 或 None"""
@@ -1423,41 +1592,168 @@ def _parse_render_data(page_or_html: str):
     except Exception:
         return None
 
-def _extract_douyin_account(page_source: str) -> dict:
-    """从页面 SSR 数据(RENDER_DATA)提取抖音账号唯一标识。
-    仅 isLogin 为真时字段可信 —— 未登录时 user_unique_id 是匿名轮换值,必须靠 isLogin 守卫。
-    候选顺序: app.user.unique_id / uid / sec_uid / app.odin.user_unique_id"""
-    result = {'logged_in': False, 'douyin_id': '', 'nickname': '', 'uid': ''}
-    data = _parse_render_data(page_source)
-    if data:
-        try:
-            app = data.get('app', {})
-            user = app.get('user', {})
-            is_login = user.get('isLogin')
-            if isinstance(is_login, str):
-                is_login = is_login.lower() in ('true', '1')
-            result['logged_in'] = bool(is_login)
-            if result['logged_in']:
-                odin = app.get('odin', {})
-                result['douyin_id'] = str(user.get('unique_id') or user.get('uid')
-                                          or user.get('sec_uid') or odin.get('user_unique_id') or '')
-                result['uid'] = str(user.get('uid') or '')
-                result['nickname'] = str(user.get('nickname') or '')
-        except Exception:
-            pass
-    if result['logged_in'] and not result['nickname']:
-        m2 = re.search(r'\\"nickname\\":\s*\\"([^\\"]+)\\"', page_source)
-        if m2:
-            result['nickname'] = m2.group(1)
+def _numeric_uid(value) -> str:
+    """账号数字 ID 归一化:未登录/占位时抖音会给 '0' 或空串,一律判无效"""
+    s = str(value or '').strip()
+    return s if s.isdigit() and s.strip('0') else ''
+
+def _account_from_render_data(data) -> dict:
+    """从 RENDER_DATA 解析账号身份。仅 isLogin 为真时字段可信 ——
+    未登录时页面里那些 id 都是匿名轮换值,必须靠 isLogin 守卫住"""
+    result = {'logged_in': False, 'douyin_id': '', 'nickname': '',
+              'uid': '', 'sec_uid': '', 'unique_id': ''}
+    if not isinstance(data, dict):
+        return result
+    app_data = data.get('app') if isinstance(data.get('app'), dict) else {}
+    user = app_data.get('user') if isinstance(app_data.get('user'), dict) else {}
+    odin = app_data.get('odin') if isinstance(app_data.get('odin'), dict) else {}
+    is_login = user.get('isLogin')
+    if isinstance(is_login, str):
+        is_login = is_login.lower() in ('true', '1')
+    result['logged_in'] = bool(is_login)
+    if not result['logged_in']:
+        return result
+    info = user.get('info') if isinstance(user.get('info'), dict) else {}
+    # 数字 uid:user.info.uid 与 odin.user_id 是同一个值,互为兜底(顺带兼容扁平结构)
+    result['uid'] = (_numeric_uid(info.get('uid')) or _numeric_uid(user.get('uid'))
+                     or _numeric_uid(odin.get('user_id')))
+    result['sec_uid'] = str(info.get('secUid') or info.get('sec_uid')
+                            or user.get('secUid') or user.get('sec_uid') or '').strip()
+    result['unique_id'] = str(info.get('uniqueId') or info.get('unique_id')
+                              or info.get('shortId') or info.get('short_id') or '').strip()
+    result['nickname'] = str(info.get('nickname') or user.get('nickname') or '').strip()
+    result['douyin_id'] = result['uid'] or result['sec_uid']  # 只认账号级 ID
     return result
 
-def _cache_douyin_user_id():
-    """登录成功后从浏览器页面提取并缓存当前抖音账号标识(用于卡密账号绑定校验)"""
+def _extract_douyin_account(page_source: str) -> dict:
+    """从浏览器当前页面的 SSR 数据(RENDER_DATA)提取抖音账号身份"""
+    info = _account_from_render_data(_parse_render_data(page_source or ''))
+    if info['logged_in'] and not info['nickname']:
+        m2 = re.search(r'\\"nickname\\":\s*\\"([^\\"]+)\\"', page_source or '')
+        if m2:
+            info['nickname'] = m2.group(1)
+    return info
+
+def resolve_current_douyin_account() -> dict:
+    """取当前登录账号身份:优先浏览器页面 SSR 数据;当前页没有(停在非抖音页或
+    SPA 跳转后)则用 cookie 走一次轻量 HTTP 探测兜底,保证标识始终能取到"""
     try:
         info = _extract_douyin_account(driver.page_source)
-        uid = info.get('douyin_id') or ''
-        if uid:
-            db_set_meta('douyin_user_id', uid)
+    except Exception:
+        info = {}
+    if info.get('uid') or info.get('sec_uid'):
+        return info
+    try:
+        cookies = driver.get_cookies()
+    except Exception:
+        cookies = db_load_cookies()
+    try:
+        logged_in, probed, _ = probe_login(cookies)
+        if logged_in and probed:
+            return probed
+    except Exception:
+        pass
+    return info or {}
+
+def _load_identity_record() -> dict:
+    try:
+        rec = json.loads(db_get_meta('douyin_identity') or '{}')
+        return rec if isinstance(rec, dict) else {}
+    except Exception:
+        return {}
+
+def _remember_douyin_identity(info) -> str:
+    """缓存账号身份并返回稳定标识。两条保证同一账号标识恒定的规则:
+    ① 取不到账号级 ID 时保持旧值不动 —— 绝不用空值/设备值覆盖,否则又会一次一个样;
+    ② uid 优先;只探到 sec_uid 且与缓存是同一账号时,沿用缓存里已有的标识,
+       避免同一个账号在 uid / sec_uid 两套 ID 空间之间来回横跳"""
+    if not isinstance(info, dict) or not info.get('logged_in'):
+        return _current_douyin_id()
+    uid, sec_uid = info.get('uid') or '', info.get('sec_uid') or ''
+    if not uid and not sec_uid:
+        return _current_douyin_id()
+    rec = _load_identity_record()
+    same_account = bool(rec) and ((uid and rec.get('uid') == uid)
+                                  or (sec_uid and rec.get('sec_uid') == sec_uid))
+    merged = dict(rec) if same_account else {}
+    for key in ('uid', 'sec_uid', 'unique_id', 'nickname'):
+        if info.get(key):
+            merged[key] = info[key]
+    stable = (merged.get('douyin_id') if same_account else '') or uid or sec_uid
+    merged['douyin_id'] = stable
+    db_set_meta('douyin_identity', json.dumps(merged, ensure_ascii=False))
+    if stable != _current_douyin_id():
+        _migrate_legacy_douyin_ids(stable)  # 仅升级后首次生效,之后换号就是真的换号
+        db_set_meta('douyin_user_id', stable)
+    return stable
+
+def _migrate_legacy_douyin_ids(new_uid: str):
+    """一次性迁移:老版本把设备级 odin.user_unique_id 当成了抖音标识,每次重登都是新值,
+    库里遗留的任务归属(tasks.slot_id)和卡密绑定(license_activation.douyin_id)全是废值。
+    升级后首次拿到真实账号 ID 时统一改写过来,否则用户原有定时任务会被当成
+    "别的账号的任务"跳过、已激活的卡密会被判成"账号不匹配"而锁死。"""
+    if not new_uid or db_get_meta('douyin_id_scheme') == DOUYIN_ID_SCHEME:
+        return
+    try:
+        with get_conn() as conn:
+            cur = conn.execute("UPDATE OR REPLACE tasks SET slot_id=? "
+                               "WHERE slot_id NOT IN ('', 'default', ?)", (new_uid, new_uid))
+            tasks_moved = cur.rowcount or 0
+            cur = conn.execute("UPDATE license_activation SET douyin_id=? "
+                               "WHERE douyin_id NOT IN ('', ?)", (new_uid, new_uid))
+            cards_moved = cur.rowcount or 0
+            # 多张遗留标识的卡被迁到同一账号名下时,只保留到期最晚的一行
+            conn.execute("DELETE FROM license_activation WHERE douyin_id=? AND id NOT IN "
+                         "(SELECT id FROM license_activation WHERE douyin_id=? "
+                         " ORDER BY expires_at DESC, id DESC LIMIT 1)", (new_uid, new_uid))
+            conn.commit()
+    except Exception as e:
+        print(f'⚠️ 抖音标识迁移失败(不影响继续使用): {str(e)[:120]}')
+        return
+    db_set_meta('douyin_id_scheme', DOUYIN_ID_SCHEME)
+    try:  # 标记文件里的绑定标识同步改写,免得 reconcile_markers 又把旧废值写回库
+        marker = read_license_markers()
+        if marker and (marker.get('douyin_id') or '') not in ('', new_uid):
+            write_license_markers(marker.get('card_ids') or [], marker.get('machine_code') or '',
+                                  marker.get('expires_at') or '', new_uid)
+    except Exception:
+        pass
+    if tasks_moved or cards_moved:
+        print(f'🔧 抖音标识已升级为账号级 ID({new_uid}):'
+              f'迁移定时任务 {tasks_moved} 个、激活记录 {cards_moved} 条')
+        _reload_task_schedule()
+
+def _reload_task_schedule():
+    """按数据库里的最新归属重建定时任务:标识迁移后内存里的 job 还带着旧 slot_id,
+    不重建会被 _scheduled_send 判成"别的账号的任务"而跳过不执行"""
+    try:
+        for bucket in list(scheduled_tasks.values()):
+            for meta in list(bucket.values()):
+                try:
+                    schedule.cancel_job(meta['job'])
+                except Exception:
+                    pass
+        scheduled_tasks.clear()
+        restore_tasks_from_db()
+    except Exception:
+        pass
+
+def resolve_identity_on_startup():
+    """启动时用已存的 cookie 轻量探一次账号身份,让标识迁移赶在定时任务注册之前完成。
+    网络不通就跳过(不阻塞启动),等心跳或下次登录时再补"""
+    try:
+        cookies = db_load_cookies()
+        if cookies:
+            logged_in, probed, _ = probe_login(cookies)
+            if logged_in and probed:
+                _remember_douyin_identity(probed)
+    except Exception:
+        pass
+
+def _cache_douyin_user_id():
+    """登录成功后提取并缓存当前抖音账号标识(卡密账号绑定校验、任务归属都依赖它)"""
+    try:
+        _remember_douyin_identity(resolve_current_douyin_account())
     except Exception:
         pass
 
@@ -1503,6 +1799,7 @@ def Status(authorization: str = Header(None)):
         return auth_err
     return {'code': 200, 'data': {
         'login': 'Yes' if Login_is_bool else 'No',
+        'login_state': 'in' if Login_is_bool else ('expired' if LOGIN_EXPIRED else 'out'),
         'browser_init': 'Yes' if init else 'No',
         'tasks_paused': db_get_meta('tasks_paused') == '1',
         'heartbeat': heartbeat_state,
@@ -1608,137 +1905,6 @@ def GetInit(authorization: str = Header(None)):
     return {'code': 200, 'data': 'Yes' if init else 'No'}
 
 
-# ========== Cookie 解析(登录用) ==========
-ALLOWED_COOKIE_KEYS = ('name', 'value', 'domain', 'path', 'secure', 'httpOnly', 'expiry', 'sameSite')
-
-def parse_cookie_payload(cooke: str, gzip_flag: bool):
-    """解析客户端传来的 Cookie 数据,逐层剥离直到得到 cookie 字典列表。
-
-    前端 /Api/login 会把用户粘贴的内容 JSON.stringify 后再 gzip+base64,
-    因此支持以下输入格式(可嵌套组合):
-    1. 纯 JSON 列表/对象:   [{"name":...,"value":...}, ...]
-    2. base64 的 JSON:      <b64(JSON)>
-    3. 旧版双层 base64:     <b64(<b64(JSON)>)>
-    4. JSON 字符串包 base64: "<b64(JSON)>"(前端 JSON.stringify 产生的引号层)
-    5. GetCooke 接口返回的 gzip+base64(gzip_flag=True,或用"字符串包base64"方式粘贴)
-    """
-    raw = cooke.strip()
-    if not raw:
-        raise ValueError('cookie 为空')
-
-    def try_b64(data: str):
-        try:
-            padded = data + '=' * (-len(data) % 4)
-            return base64.b64decode(padded, validate=True)
-        except Exception:
-            return None
-
-    # 1) 外层:前端总是 base64 编码(自动补齐 = 号)
-    blob = try_b64(raw)
-    if gzip_flag:
-        if blob is None:
-            raise ValueError('gzip 标志为真,但 cookie 不是有效 base64')
-        try:
-            blob = gzip.decompress(blob)
-        except Exception as e:
-            raise ValueError(f'gzip 解压失败,请确认数据来源与 gzip 标志: {e}')
-    if blob is not None:
-        try:
-            text = blob.decode('utf-8').strip()
-        except UnicodeDecodeError:
-            text = raw  # 解码失败,退回原始文本
-    else:
-        text = raw
-
-    # 2) 逐层剥离:JSON 字符串 -> base64 -> (可选 gzip) -> JSON,最多 5 层
-    cookies = None
-    for _layer in range(5):
-        stripped = text.strip()
-        if stripped.startswith(('{', '[', '"')):
-            try:
-                obj = json.loads(stripped)
-            except Exception:
-                raise ValueError(f'cookie JSON 解析失败: {stripped[:80]}...')
-            if isinstance(obj, list):
-                cookies = obj
-                break
-            if isinstance(obj, dict):
-                cookies = [obj]
-                break
-            if isinstance(obj, str):  # JSON 字符串包装的一层,继续剥
-                text = obj.strip()
-                continue
-            raise ValueError('cookie JSON 格式错误: 应为列表/对象/字符串')
-        # 尝试 base64 剥层
-        blob = try_b64(text)
-        if blob is not None:
-            try:
-                text = blob.decode('utf-8').strip()
-                continue
-            except UnicodeDecodeError:
-                pass  # 可能是 gzip 二进制,下面尝试解压
-            try:
-                text = gzip.decompress(blob).decode('utf-8').strip()
-                continue
-            except Exception:
-                raise ValueError('cookie 无法解析: base64 内容既不是文本也不是 gzip')
-        raise ValueError(f'cookie 无法解析: 既不是 JSON 也不是有效 base64 ({stripped[:80]}...)')
-
-    if cookies is None:
-        raise ValueError('cookie 解析失败')
-    if not all(isinstance(c, dict) for c in cookies):
-        raise ValueError('cookie 格式错误: 应为字典列表')
-    return cookies
-
-@app.post('/Api/login')  # 登录 传入cooke
-@with_driver_recovery
-def Login(cooke: str = Body(default=None), gzip_flag: bool = Body(default=False), authorization: str = Header(None)):
-    auth_err = require_auth(authorization)
-    if auth_err:
-        return auth_err
-    global Login_is_bool
-    if not cooke:
-        return {'code': 404, 'data': 'login-error-not cooker'}
-    try:
-        cookie_list = parse_cookie_payload(cooke, gzip_flag)
-    except Exception as e:
-        return {'code': 404, 'data': f'login-error-cookie parse error: {e}(如使用 GetCooke 接口返回的数据,请携带 gzip_flag=true)'}
-
-    # 先打开 douyin 域名再注入 cookie(域名不符会被浏览器丢弃)
-    driver.get(DOUYIN_HOME)
-    ok_count = 0
-    for cookie in cookie_list:
-        clean = {k: cookie[k] for k in ALLOWED_COOKIE_KEYS if k in cookie and cookie[k] not in (None, '')}
-        if 'name' not in clean or 'value' not in clean:
-            continue
-        # sameSite 归一化,避免 chromedriver 报非法值
-        ss = str(clean.get('sameSite', '')).lower()
-        if ss in ('lax', 'strict', 'none', 'no_restriction'):
-            clean['sameSite'] = {'no_restriction': 'None'}.get(ss, ss.capitalize())
-        else:
-            clean.pop('sameSite', None)
-        try:
-            driver.add_cookie(clean)
-            ok_count += 1
-        except Exception as e:
-            print(f'⚠️ 注入 cookie 失败({clean.get("name")}): {e}')
-    if ok_count == 0:
-        return {'code': 404, 'data': 'login-error-no valid cookie injected'}
-
-    # 打开聊天页验证登录结果
-    driver.get(DOUYIN_CHAT)
-    time.sleep(3)
-    panel_exists = bool(driver.find_elements(By.XPATH, LOGIN_PANEL_XPATH))
-    has_session = any(c.get('name') == 'sessionid_ss' for c in driver.get_cookies())
-    if panel_exists or not has_session:
-        Login_is_bool = False
-        return {'code': 404, 'data': 'login-error-cooker cant login(Cookie 已失效或未登录)'}
-    Login_is_bool = True
-    db_save_cookies(driver.get_cookies())  # 供心跳探测使用
-    _cache_douyin_user_id()  # 缓存当前抖音账号标识(卡密账号绑定校验)
-    print('✅ Cookie 登录成功')
-    return {'code': 200, 'data': 'ok'}
-
 @app.get('/Api/Pnglogin')  # 扫码登录状态检测
 @with_driver_recovery
 def PngLogin(authorization: str = Header(None)):
@@ -1751,13 +1917,15 @@ def PngLogin(authorization: str = Header(None)):
         return {'code': 200, 'data': 'already_logged_in'}
     # 不刷新页面（刷新会打断正在进行的扫码）；通过“登录弹窗消失 + 存在登录会话cookie”判定登录成功
     try:
-        panel_exists = bool(driver.find_elements(By.XPATH, LOGIN_PANEL_XPATH))
+        panel_exists = _login_panel_visible()
     except Exception:
         panel_exists = True
     cooke = driver.get_cookies()
     has_session = any(c.get('name') == 'sessionid_ss' for c in cooke)
     if not panel_exists and has_session:
         Login_is_bool = True
+        LOGIN_EXPIRED = False
+        LOGIN_EXPIRED_REASON = ''
         db_save_cookies(cooke)  # 供心跳探测使用
         _cache_douyin_user_id()  # 缓存当前抖音账号标识(卡密账号绑定校验)
         print('✅ 扫码登录成功')
@@ -1769,7 +1937,10 @@ def GetLogin(authorization: str = Header(None)):
     auth_err = require_auth(authorization)
     if auth_err:
         return auth_err
-    return {'code': 200, 'data': 'Yes' if Login_is_bool else 'No'}
+    # login_state 三态:in=已登录 / out=未登录 / expired=会话已过期(前端提示重新登录)
+    state = 'in' if Login_is_bool else ('expired' if LOGIN_EXPIRED else 'out')
+    return {'code': 200, 'data': 'Yes' if Login_is_bool else 'No',
+            'login_state': state, 'expired_reason': LOGIN_EXPIRED_REASON}
 
 @app.get('/Api/login/Init/GetLoginPng')  # 获取登录扫码
 @with_driver_recovery
@@ -1783,40 +1954,35 @@ def GetLoginPng(authorization: str = Header(None)):
     if not ensure_login_dialog():
         return {'code': 404, 'data': '登录弹窗未出现,请重试'}
     for _attempt in range(3):
-        login_src = None
+        # 先尝试直接读二维码 img(正常状态)
         try:
-            img_element = driver.find_element(By.XPATH, '//*[@id="animate_qrcode_container"]//img')
-            login_src = img_element.get_attribute('src')
+            login_src = driver.find_element(By.XPATH, '//*[@id="animate_qrcode_container"]//img').get_attribute('src')
         except NoSuchElementException:
             login_src = None
         if login_src:
             return {'code': 200, 'data': login_src}
-        # 二维码已扫描/失效时点击刷新层获取新二维码；无刷新层时静默失败
+        # 二维码已扫描/失效:点击旧版刷新层,或带"重新获取/点击刷新"文案的任意元素
+        # (抖音改版后旧选择器 div[2]/div 已不存在,文案点击更稳)
         try:
             driver.find_element(By.XPATH, '//*[@id="animate_qrcode_container"]/div[2]/div').click()
         except Exception:
-            pass
+            try:
+                driver.find_element(By.XPATH,
+                    '//*[@id="animate_qrcode_container"]//*[contains(text(),"重新获取") '
+                    'or contains(text(),"点击刷新") or contains(text(),"刷新")]').click()
+            except Exception:
+                pass
         time.sleep(3)
+    # 兜底:整页重载,登录弹窗会重新渲染出全新二维码
+    try:
+        driver.get(DOUYIN_CHAT)
+        time.sleep(6)
+        login_src = driver.find_element(By.XPATH, '//*[@id="animate_qrcode_container"]//img').get_attribute('src')
+        if login_src:
+            return {'code': 200, 'data': login_src}
+    except Exception:
+        pass
     return {'code': 404, 'data': 'cant find LoginPng src attribute'}
-
-@app.get('/Api/login/Init/GetCooker')  # 获取cooke
-@with_driver_recovery
-def GetCooke(password: str = Query(None), authorization: str = Header(None)):
-    auth_err = require_auth(authorization)
-    if auth_err:
-        return auth_err
-    # 验证密码
-    if not password or hash_pwd(password) != hash_pwd(_password):
-        return {'code': 401, 'data': '密码错误'}
-    if Login_is_bool:
-        cooke = driver.get_cookies()
-        cookie_json = json.dumps(cooke)
-        # 先gzip压缩，再base64编码
-        cookie_gzip = gzip.compress(cookie_json.encode('utf-8'))
-        cookie_base64 = base64.b64encode(cookie_gzip).decode('utf-8')
-        return {'code': 200, 'data': {'cooke': cookie_base64, 'gzip_flag': True}}
-    else:
-        return {'code': 401, 'data': '未登录'}
 
 @app.get('/Api/GetFriendsList')  # 获取好友列表
 @with_driver_recovery
@@ -1865,11 +2031,15 @@ def GetDouyinUserInfo(authorization: str = Header(None)):
     if not Login_is_bool:
         return {'code': 200, 'data': {'logged_in': False, 'douyin_id': '', 'nickname': '', 'uid': ''}}
     try:
-        info = _extract_douyin_account(driver.page_source)
-        info['logged_in'] = info['logged_in'] or Login_is_bool
-        if info.get('douyin_id'):
-            db_set_meta('douyin_user_id', info['douyin_id'])  # 刷新账号标识缓存
-        return {'code': 200, 'data': info}
+        info = resolve_current_douyin_account()
+        stable = _remember_douyin_identity(info)  # 刷新账号标识缓存(只认账号级 ID)
+        rec = _load_identity_record()
+        return {'code': 200, 'data': {
+            'logged_in': bool(info.get('logged_in')) or Login_is_bool,
+            'douyin_id': stable or '',
+            'nickname': info.get('nickname') or rec.get('nickname') or '',
+            'uid': info.get('uid') or rec.get('uid') or '',
+            'unique_id': info.get('unique_id') or rec.get('unique_id') or ''}}
     except Exception as e:
         return {'code': 400, 'data': f'获取失败: {str(e)[:150]}'}
 
@@ -1922,10 +2092,30 @@ def DieLogin(authorization: str = Header(None)):
     auth_err = require_auth(authorization)
     if auth_err:
         return auth_err
-    global Login_is_bool
-    driver.delete_all_cookies()
+    global Login_is_bool, LOGIN_EXPIRED, LOGIN_EXPIRED_REASON
+    # 彻底登出:只清 cookie 不够 —— 抖音网页端把会话也存在 localStorage/IndexedDB,
+    # 页面一重载又自动登回来(表现就是"强制退出后仍检测到历史账号")
+    try:
+        driver.execute_script(
+            "localStorage.clear(); sessionStorage.clear();"
+            "try { indexedDB.databases().then(function(dbs){ dbs.forEach(function(d){ indexedDB.deleteDatabase(d.name); }); }); } catch(e) {}"
+        )
+    except Exception as e:
+        print(f'⚠️ 清理浏览器本地存储失败: {e}')
+    try:
+        driver.delete_all_cookies()
+    except Exception:
+        pass
+    db_save_cookies([])  # 同步清空落库 cookie,防止心跳探测按旧 cookie 判登录
     Login_is_bool = False
-    return {'code': 200, 'data': '已清除Cooke'}
+    LOGIN_EXPIRED = False
+    LOGIN_EXPIRED_REASON = ''
+    # 重载页面让登录弹窗出现,方便立即重新扫码
+    try:
+        driver.get(DOUYIN_CHAT)
+    except Exception:
+        pass
+    return {'code': 200, 'data': '已彻底退出登录'}
 
 @app.get('/Api/LoginPhone')  # 验证码登录
 @with_driver_recovery
@@ -1978,10 +2168,12 @@ def LoginPhoneInput(code: str, authorization: str = Header(None)):
         button = driver.find_element(By.XPATH, '//*[@id="douyin_login_comp_btn_id"]')
         button.click()
         time.sleep(3)
-        panel_exists = bool(driver.find_elements(By.XPATH, LOGIN_PANEL_XPATH))
+        panel_exists = _login_panel_visible()
         has_session = any(c.get('name') == 'sessionid_ss' for c in driver.get_cookies())
         if not panel_exists and has_session:
             Login_is_bool = True
+            LOGIN_EXPIRED = False
+            LOGIN_EXPIRED_REASON = ''
             db_save_cookies(driver.get_cookies())
             _cache_douyin_user_id()  # 缓存当前抖音账号标识(卡密账号绑定校验)
             print('✅ 验证码登录成功')
@@ -2005,12 +2197,24 @@ def add_time(time: str, name: str, text: str = None, authorization: str = Header
         return license_err
     return _add_time_with_driver(time, name, text)
 
+def _current_task_buckets() -> list:
+    """当前登录账号可见的任务桶:本账号 + default(未归属的旧任务)。
+    返回 [(slot_id, bucket_dict), ...]"""
+    uid = _current_douyin_id()
+    out = []
+    for sid in (uid, 'default'):
+        if sid:
+            out.append((sid, scheduled_tasks.setdefault(sid, {})))
+    return out
+
 @with_driver_recovery
 def _add_time_with_driver(time: str, name: str, text: str = None):
     if not name:
         return {'code': 400, 'data': 'name 不能为空'}
-    # 检查是否已存在该好友的定时任务
-    for task_id in scheduled_tasks:
+    slot = _current_douyin_id() or 'default'
+    bucket = scheduled_tasks.setdefault(slot, {})
+    # 检查该账号下是否已存在此好友的定时任务
+    for task_id in bucket:
         if task_id.endswith(f"_{name}"):
             return {'code': 400, 'data': f'好友 {name} 已有定时任务，请先删除或修改'}
 
@@ -2018,12 +2222,12 @@ def _add_time_with_driver(time: str, name: str, text: str = None):
     if temp.is_bool:
         play_time = format_time(time)
         msg = AiqingGongyu_text() if text in (None, '') else text
-        # 先写数据库(重启后自动恢复)
-        db_id = db_insert_task(name, play_time, msg)
-        job = register_task_job(db_id, name, msg, play_time)
+        # 先写数据库(重启后自动恢复),任务归属当前抖音账号
+        db_id = db_insert_task(name, play_time, msg, slot)
+        job = register_task_job(db_id, name, msg, play_time, slot)
         # 生成唯一任务ID
         task_id = f"{play_time}_{name}"
-        scheduled_tasks[task_id] = {'job': job, 'db_id': db_id}
+        bucket[task_id] = {'job': job, 'db_id': db_id}
         return {'code': 200, 'data': f'已添加定时任务: {play_time}', 'task_id': task_id}
     else:
         return {'code': 404, 'data': temp.string}
@@ -2033,35 +2237,39 @@ def del_time(task_id: str, authorization: str = Header(None)):
     auth_err = require_auth(authorization)
     if auth_err:
         return auth_err
-    """根据任务ID删除定时任务"""
-    if task_id in scheduled_tasks:
-        info = scheduled_tasks[task_id]
-        schedule.cancel_job(info['job'])
-        _cancel_retry_jobs(info['db_id'])
-        db_delete_task(info['db_id'])
-        del scheduled_tasks[task_id]
-        return {'code': 200, 'data': f'已删除任务: {task_id}'}
-    else:
-        return {'code': 404, 'data': '任务ID不存在'}
+    """根据任务ID删除定时任务(仅当前账号可见的任务)"""
+    for sid, bucket in _current_task_buckets():
+        if task_id in bucket:
+            info = bucket[task_id]
+            schedule.cancel_job(info['job'])
+            _cancel_retry_jobs(info['db_id'])
+            db_delete_task(info['db_id'])
+            del bucket[task_id]
+            return {'code': 200, 'data': f'已删除任务: {task_id}'}
+    return {'code': 404, 'data': '任务ID不存在'}
 
 @app.get('/Time/edit')
 def edit_time(name: str, new_time: str, authorization: str = Header(None)):
     auth_err = require_auth(authorization)
     if auth_err:
         return auth_err
-    """修改指定好友的定时任务时间"""
+    """修改指定好友的定时任务时间(仅当前账号可见的任务)"""
     # 查找该好友的现有任务
-    old_task_id = None
-    for task_id in scheduled_tasks:
-        if task_id.endswith(f"_{name}"):
-            old_task_id = task_id
+    old_slot, old_task_id = None, None
+    for sid, bucket in _current_task_buckets():
+        for task_id in bucket:
+            if task_id.endswith(f"_{name}"):
+                old_slot, old_task_id = sid, task_id
+                break
+        if old_task_id:
             break
 
     if not old_task_id:
         return {'code': 404, 'data': f'好友 {name} 没有定时任务'}
 
+    bucket = scheduled_tasks.setdefault(old_slot, {})
     # 取消旧任务
-    old_info = scheduled_tasks[old_task_id]
+    old_info = bucket[old_task_id]
     old_job = old_info['job']
     old_db_id = old_info['db_id']
     schedule.cancel_job(old_job)
@@ -2075,12 +2283,12 @@ def edit_time(name: str, new_time: str, authorization: str = Header(None)):
     new_play_time = format_time(new_time)
     msg = AiqingGongyu_text()  # 获取新的名言
     db_update_task_time(old_db_id, new_play_time)
-    new_job = register_task_job(old_db_id, name, msg, new_play_time)
+    new_job = register_task_job(old_db_id, name, msg, new_play_time, old_slot)
 
     # 生成新任务ID并替换
     new_task_id = f"{new_play_time}_{name}"
-    scheduled_tasks[new_task_id] = {'job': new_job, 'db_id': old_db_id}
-    del scheduled_tasks[old_task_id]
+    bucket[new_task_id] = {'job': new_job, 'db_id': old_db_id}
+    del bucket[old_task_id]
 
     return {
         'code': 200,
@@ -2095,22 +2303,23 @@ def get_time_list(authorization: str = Header(None)):
     auth_err = require_auth(authorization)
     if auth_err:
         return auth_err
-    """获取当前所有定时任务列表"""
+    """获取当前账号的定时任务列表(其他账号的任务保留但不在本账号展示)"""
     tasks = []
     paused = db_get_meta('tasks_paused') == '1'
-    for task_id, info in scheduled_tasks.items():
-        # 解析任务ID获取信息
-        parts = task_id.split('_', 1)
-        if len(parts) == 2:
-            time_str, name = parts
-            job = info['job']
-            tasks.append({
-                'task_id': task_id,
-                'time': time_str,
-                'name': name,
-                'next_run': str(job.next_run) if job.next_run else None,
-                'paused': paused,
-            })
+    for sid, bucket in _current_task_buckets():
+        for task_id, info in bucket.items():
+            # 解析任务ID获取信息
+            parts = task_id.split('_', 1)
+            if len(parts) == 2:
+                time_str, name = parts
+                job = info['job']
+                tasks.append({
+                    'task_id': task_id,
+                    'time': time_str,
+                    'name': name,
+                    'next_run': str(job.next_run) if job.next_run else None,
+                    'paused': paused,
+                })
     return {'code': 200, 'data': {'count': len(tasks), 'tasks': tasks}}
 
 @app.get('/Api/GetTaskLogs')  # 任务执行日志
@@ -2165,12 +2374,16 @@ def change_password(old_password: str, new_password: str, authorization: str = H
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dist')
 
 def setup_static():
-    """打包版:后端托管前端构建产物(SPA fallback);未知 API 路径返回 404 JSON"""
+    """打包版:后端托管前端构建产物(SPA fallback);未知 API 路径返回 404 JSON。
+    index.html 强制 no-cache:升级 exe 后浏览器自动加载新前端,
+    不会继续用旧缓存的 JS 去调已删除的接口(如旧版 /Api/Accounts 报 404)"""
     if not os.path.isdir(STATIC_DIR):
         return
     from fastapi.staticfiles import StaticFiles
     from fastapi.responses import FileResponse, JSONResponse
     app.mount('/assets', StaticFiles(directory=os.path.join(STATIC_DIR, 'assets')), name='assets')
+
+    NO_CACHE = {'Cache-Control': 'no-cache, no-store, must-revalidate'}
 
     @app.get('/{full_path:path}')
     def spa_fallback(request: Request, full_path: str):
@@ -2180,7 +2393,7 @@ def setup_static():
         target = os.path.join(STATIC_DIR, full_path)
         if full_path and os.path.isfile(target):
             return FileResponse(target)
-        return FileResponse(os.path.join(STATIC_DIR, 'index.html'))
+        return FileResponse(os.path.join(STATIC_DIR, 'index.html'), headers=NO_CACHE)
 
 def pick_port(preferred: int = 9844, attempts: int = 20) -> int:
     """优先用固定端口(用户可预测、能手动访问),被占用则顺延;全被占用才回退随机端口。
@@ -2347,6 +2560,7 @@ def main():
     setup_chromedriver_fallback()
     init_db()
     reconcile_markers()
+    resolve_identity_on_startup()  # 先定位账号标识,让遗留标识迁移赶在任务注册之前
     start_license_guard()
     start_heartbeat()
     restore_tasks_from_db()
