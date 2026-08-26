@@ -121,6 +121,7 @@ import { useLicenseStore } from '../stores/license'
 const license = useLicenseStore()
 import { friendsList as storeFriendsList, setFriendsList } from '../stores/browser'
 
+
 const loading = ref(false)
 const taskList = ref([])
 const isFirstLoad = ref(true)
