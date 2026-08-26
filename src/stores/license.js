@@ -16,6 +16,17 @@ export const useLicenseStore = defineStore('license', () => {
 
   const isActive = computed(() => status.value === 'active')
 
+  // 剩余时长统一文案:不足 1 天按小时展示(后端 days_left 是向上取整,1 小时卡会显示 1 天,
+  // 精确值在 expires_in_seconds,展示必须优先用它)
+  const remainingText = computed(() => {
+    if (status.value !== 'active') return '未激活'
+    const sec = expiresInSeconds.value
+    if (sec != null && sec > 0 && sec < 86400) {
+      return `剩余不足1天(约${Math.max(1, Math.round(sec / 3600))}小时)`
+    }
+    return `剩余 ${daysLeft.value} 天`
+  })
+
   async function fetchStatus() {
     loading.value = true
     try {
@@ -41,5 +52,5 @@ export const useLicenseStore = defineStore('license', () => {
     daysLeft.value = 0
   }
 
-  return { status, machineCode, activatedAt, expiresAt, daysLeft, expiresInSeconds, loaded, loading, isActive, fetchStatus, reset }
+  return { status, machineCode, activatedAt, expiresAt, daysLeft, expiresInSeconds, loaded, loading, isActive, remainingText, fetchStatus, reset }
 })
