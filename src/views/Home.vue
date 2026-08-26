@@ -44,8 +44,10 @@
             <div class="stat-info">
               <div class="stat-label">登录状态</div>
               <div class="stat-value">
-                <span class="status-text">{{ displayLogin ? '已登录' : '未登录' }}</span>
-                <span class="status-dot" :class="displayLogin ? 'online' : 'offline'"></span>
+                <span class="status-text">
+                  {{ displayLogin ? '已登录' : (loginState === 'expired' ? '会话已过期,请重新登录' : '未登录') }}
+                </span>
+                <span class="status-dot" :class="displayLogin ? 'online' : (loginState === 'expired' ? 'expired' : 'offline')"></span>
               </div>
             </div>
           </div>
@@ -160,7 +162,7 @@
               <span class="info-label">授权状态</span>
               <span class="info-value">
                 <el-tag :type="license.isActive ? 'success' : 'danger'" size="small">
-                  {{ license.isActive ? `剩余 ${license.daysLeft} 天` : '未激活' }}
+                  {{ license.remainingText }}
                 </el-tag>
               </span>
             </div>
@@ -271,7 +273,7 @@ const formatUptime = (startTime) => {
   return parts.join(' ')
 }
 
-// 从 localStorage 恢复任务数据
+// 从 localStorage 恢复任务数据(按槽位)
 const restoreFromLocalStorage = () => {
   const tasks = JSON.parse(localStorage.getItem('douyin_tasks') || '[]')
   taskCount.value = tasks.length
@@ -298,14 +300,17 @@ const checkBrowserStatus = async () => {
   }
 }
 
+const loginState = ref('out')
 const checkLoginStatus = async () => {
   try {
     const res = await getLoginStatus()
     loginStatus.value = res.data === 'Yes'
     setLoginStatus(loginStatus.value)
+    loginState.value = res.login_state || (loginStatus.value ? 'in' : 'out')
   } catch (error) {
     loginStatus.value = false
     setLoginStatus(false)
+    loginState.value = 'out'
   }
 }
 
@@ -342,7 +347,7 @@ const loadTaskList = async () => {
     const res = await getTaskList()
     taskCount.value = res.data.count || 0
     recentTasks.value = res.data.tasks?.slice(0, 5) || []
-    // 保存到 localStorage
+    // 保存到 localStorage(按槽位)
     localStorage.setItem('douyin_tasks', JSON.stringify(res.data.tasks || []))
   } catch (error) {
     console.error('加载任务列表失败:', error)
@@ -422,6 +427,7 @@ onMounted(async () => {
 onActivated(() => {
   // 无需额外操作，数据已通过缓存保持最新
 })
+
 </script>
 
 <style scoped>
@@ -650,6 +656,13 @@ onActivated(() => {
   background: #ff4d4f;
   box-shadow: 0 0 8px rgba(255, 77, 79, 0.5);
 }
+
+.status-dot.expired {
+  background: #faad14;
+  box-shadow: 0 0 8px rgba(250, 173, 20, 0.6);
+  animation: pulse 2s infinite;
+}
+
 
 @keyframes pulse {
   0%, 100% { opacity: 1; }
