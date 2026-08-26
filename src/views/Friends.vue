@@ -277,6 +277,7 @@ const loadFriends = async () => {
   }
 }
 
+
 const openSendDialog = (friend) => {
   sendForm.value = {
     name: friend.name,
