@@ -10,8 +10,8 @@
       <div class="account-section">
         <el-descriptions :column="1" border>
           <el-descriptions-item label="登录状态">
-            <el-tag :type="displayLogin ? 'success' : 'danger'">
-              {{ displayLogin ? (username ? '已登录: ' + username : '已登录') : '未登录' }}
+            <el-tag :type="displayLogin ? 'success' : (loginState === 'expired' ? 'warning' : 'danger')">
+              {{ displayLogin ? (username ? '已登录: ' + username : '已登录') : (loginState === 'expired' ? '会话已过期,请重新登录' : '未登录') }}
             </el-tag>
           </el-descriptions-item>
         </el-descriptions>
@@ -23,14 +23,8 @@
           <el-button type="primary" :icon="Message" @click="phoneDialogVisible = true" :disabled="loginStatus">
             验证码登录
           </el-button>
-          <el-button :icon="Edit" @click="manualDialogVisible = true" :disabled="loginStatus">
-            手动登录
-          </el-button>
           <el-button :icon="Refresh" @click="handleRefreshStatus" :loading="refreshStatusLoading">
             刷新状态
-          </el-button>
-          <el-button :icon="Document" @click="cookieDialogVisible = true">
-            获取Base64Cookie
           </el-button>
           <el-button :icon="SwitchButton" type="danger" @click="handleDieLogin" :disabled="!displayLogin">
             强制退出登录
@@ -97,37 +91,6 @@
       <template #footer>
         <el-button @click="renewDialogVisible = false">取消</el-button>
         <el-button type="primary" @click="handleRenewActivate" :loading="renewLoading">激活</el-button>
-      </template>
-    </el-dialog>
-
-    <!-- 手动登录弹窗 -->
-    <el-dialog v-model="manualDialogVisible" title="手动登录" width="500px" destroy-on-close>
-      <el-form :model="manualForm" label-width="100px">
-        <el-form-item label="Base64Cookie">
-          <el-input
-            v-model="manualForm.cookie"
-            type="textarea"
-            :rows="6"
-            placeholder="请输入登录Base64Cookie"
-          />
-        </el-form-item>
-      </el-form>
-      <template #footer>
-        <el-button @click="manualDialogVisible = false">取消</el-button>
-        <el-button type="primary" @click="handleManualLogin" :loading="manualLoading">
-          验证登录
-        </el-button>
-      </template>
-    </el-dialog>
-
-    <!-- 获取Cookie弹窗 -->
-    <el-dialog v-model="cookieDialogVisible" title="获取Base64Cookie" width="400px" destroy-on-close>
-      <p style="margin: 0; color: #606266;">将复制当前抖音登录态的 Base64 Cookie,可用于备份或迁移到其他设备。</p>
-      <template #footer>
-        <el-button @click="cookieDialogVisible = false">取消</el-button>
-        <el-button type="primary" @click="handleGetCookie" :loading="cookieLoading">
-          获取并复制
-        </el-button>
       </template>
     </el-dialog>
 
@@ -211,8 +174,8 @@
 import { ref, computed, onMounted, onActivated, watch, onUnmounted } from 'vue'
 import axios from 'axios'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Key, Refresh, View, Loading, Edit, Document, SwitchButton, Picture, Message } from '@element-plus/icons-vue'
-import { getInitStatus, getLoginStatus, initBrowser, getLoginPng, login, getUsername, getDouyinUserInfo, getFriendsList, getCooker, logout, pnglogin, getScrlk, dieLogin, sendVerifyCode, submitVerifyCode, activateLicense } from '../api/douyin'
+import { Key, Refresh, View, Loading, SwitchButton, Picture, Message } from '@element-plus/icons-vue'
+import { getInitStatus, getLoginStatus, initBrowser, getLoginPng, getUsername, getDouyinUserInfo, getFriendsList, logout, pnglogin, getScrlk, dieLogin, sendVerifyCode, submitVerifyCode, activateLicense } from '../api/douyin'
 import { loginStatus, hasLoaded, setLoginStatus, setFriendsList } from '../stores/browser'
 import { useLicenseStore } from '../stores/license'
 
@@ -223,16 +186,9 @@ const refreshStatusLoading = ref(false)
 const qrDialogVisible = ref(false)
 const qrcodeUrl = ref('')
 const loading = ref(false)
-const manualDialogVisible = ref(false)
-const manualLoading = ref(false)
-const manualForm = ref({
-  cookie: ''
-})
 const username = ref(localStorage.getItem('douyin_username') || '')
 const usernameLoaded = ref(localStorage.getItem('douyin_username_loaded') === '1')
 const settingsLoaded = ref(localStorage.getItem('douyin_settings_loaded') === '1')
-const cookieDialogVisible = ref(false)
-const cookieLoading = ref(false)
 // 授权信息
 const license = useLicenseStore()
 const renewDialogVisible = ref(false)
@@ -309,14 +265,7 @@ const formatExpire = (iso) => {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }
 
-const formatRemaining = () => {
-  if (!license.isActive) return '-'
-  const sec = license.expiresInSeconds
-  if (sec != null && sec > 0 && license.daysLeft < 1) {
-    return `不足1天(约${Math.max(1, Math.round(sec / 3600))}小时)`
-  }
-  return `${license.daysLeft} 天`
-}
+const formatRemaining = () => license.remainingText
 
 const handleRenewActivate = async () => {
   if (!renewCard.value.trim()) {
@@ -356,17 +305,20 @@ const fetchUsername = async () => {
   }
 }
 
+const loginState = ref('out')
 const checkLoginStatus = async () => {
   try {
     const res = await getLoginStatus()
     loginStatus.value = res.data === 'Yes'
     setLoginStatus(loginStatus.value)
+    loginState.value = res.login_state || (loginStatus.value ? 'in' : 'out')
     if (loginStatus.value && !usernameLoaded.value) {
       await fetchUsername()
     }
   } catch (error) {
     loginStatus.value = false
     setLoginStatus(false)
+    loginState.value = 'out'
   }
 }
 
@@ -450,6 +402,7 @@ const startQrPoll = () => {
       if (res.data && (res.data.code == 200 || res.data.code == '200')) {
         stopQrPoll()
         loginStatus.value = true
+        loginState.value = 'in'
         setLoginStatus(true)
         qrDialogVisible.value = false
         ElMessage.success('登录成功，扫码登录窗口将关闭')
@@ -477,6 +430,7 @@ const handleRefreshCode = async () => {
     if (res.data === 'already_logged_in') {
       qrDialogVisible.value = false
       setLoginStatus(true)
+      loginState.value = 'in'
       await fetchUsername()
       await fetchFriendsList()
       ElMessage.success('检测到抖音已登录,无需重复扫码')
@@ -492,88 +446,6 @@ const handleRefreshCode = async () => {
     ElMessage.error('刷新失败，请确保浏览器已初始化')
   } finally {
     refreshLoading.value = false
-  }
-}
-
-const handleManualLogin = async () => {
-  if (!manualForm.value.cookie.trim()) {
-    ElMessage.warning('请输入Base64Cookie')
-    return
-  }
-  manualLoading.value = true
-  try {
-    const res = await login(manualForm.value.cookie)
-    if (res.data === 'ok') {
-      ElMessage.success('登录成功')
-      loginStatus.value = true
-      setLoginStatus(true)
-      manualDialogVisible.value = false
-      username.value = ''
-      usernameLoaded.value = false
-      localStorage.removeItem('douyin_username')
-      localStorage.removeItem('douyin_username_loaded')
-      await fetchUsername()
-      await fetchFriendsList()
-    } else {
-      ElMessage.error('登录失败，Cookie无效')
-    }
-  } catch (error) {
-    ElMessage.error('登录失败，请检查Cookie')
-  } finally {
-    manualLoading.value = false
-  }
-}
-
-const handleGetCookie = async () => {
-  cookieLoading.value = true
-  try {
-    const res = await getCooker()
-    console.log('Cookie:', res.data.cooke)
-    if (res.code == 200) {
-      const textArea = document.createElement('textarea')
-      textArea.value = res.data.cooke
-      textArea.style.position = 'fixed'
-      textArea.style.left = '-9999px'
-      document.body.appendChild(textArea)
-      textArea.select()
-      try {
-        document.execCommand('copy')
-        ElMessage.success('Cookie已复制到剪贴板')
-        cookieDialogVisible.value = false
-      } catch {
-        ElMessage.error('复制失败，请手动复制控制台输出的Cookie')
-      } finally {
-        document.body.removeChild(textArea)
-      }
-    } else {
-      ElMessage.error(res.data || '获取失败，请先登录抖音')
-    }
-  } catch (error) {
-    ElMessage.error('获取失败')
-  } finally {
-    cookieLoading.value = false
-  }
-}
-
-const handleLogout = async () => {
-  try {
-    await logout()
-    setLoginStatus(false)
-    localStorage.removeItem('douyin_token')
-    ElMessage.success('已退出登录')
-  } catch (error) {
-    ElMessage.error('退出失败')
-  }
-}
-
-const handleDieLogin = async () => {
-  try {
-    await dieLogin()
-    setLoginStatus(false)
-    localStorage.removeItem('douyin_token')
-    ElMessage.success('已强制退出登录')
-  } catch (error) {
-    ElMessage.error('强制退出失败')
   }
 }
 
@@ -620,6 +492,7 @@ const handlePhoneLogin = async () => {
       ElMessage.success('登录成功')
       phoneDialogVisible.value = false
       setLoginStatus(true)
+      loginState.value = 'in'
       username.value = ''
       usernameLoaded.value = false
       localStorage.removeItem('douyin_username')
@@ -652,6 +525,22 @@ const handleGetScreenshot = async () => {
   }
 }
 
+const handleDieLogin = async () => {
+  try {
+    await dieLogin()
+    setLoginStatus(false)
+    loginState.value = 'out'
+    localStorage.removeItem('douyin_token')
+    localStorage.removeItem('douyin_username')
+    localStorage.removeItem('douyin_username_loaded')
+    ElMessage.success('已彻底退出登录,页面即将刷新')
+    // 刷新整页:登录态/好友/授权信息全部重拉,保证可以正常重新扫码换号
+    setTimeout(() => { window.location.reload() }, 800)
+  } catch (error) {
+    ElMessage.error('强制退出失败')
+  }
+}
+
 const handleLogin = async () => {
   loginLoading.value = true
   loading.value = true
@@ -668,6 +557,7 @@ const handleLogin = async () => {
       // 后端已登录:直接提示,采集已有 cookie,无需扫码
       qrDialogVisible.value = false
       setLoginStatus(true)
+      loginState.value = 'in'
       await fetchUsername()
       await fetchFriendsList()
       ElMessage.success('检测到抖音已登录,无需重复扫码')
